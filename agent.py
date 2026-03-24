@@ -5,17 +5,14 @@ Agentic workflow for section-by-section summarization
 with conversation-based refinement.
 """
 
-import json
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Annotated
-from dataclasses import dataclass, field
+from typing import Any, TypedDict
 
 from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
 
 
 # ─── In-memory stores ────────────────────────────────────────────────
@@ -59,9 +56,14 @@ def log_trace(session_id: str, node: str, input_summary: str, output_summary: st
 
 # ─── Agent State ──────────────────────────────────────────────────────
 
-class AgentState(dict):
+class AgentState(TypedDict):
     """State for the summarization agent graph."""
-    pass
+    session_id: str
+    llm_config: dict
+    parsed_ppt: dict
+    section_summaries: list
+    executive_summary: str
+    all_summaries_text: str
 
 
 # ─── LLM Setup ───────────────────────────────────────────────────────
@@ -154,7 +156,7 @@ Original section summaries for reference:
 
 # ─── Graph Nodes ──────────────────────────────────────────────────────
 
-async def summarize_sections_node(state: AgentState) -> AgentState:
+async def summarize_sections_node(state: AgentState) -> dict:
     """Node: Summarize each section independently."""
     config = state["llm_config"]
     llm = create_llm(config)
@@ -208,11 +210,10 @@ async def summarize_sections_node(state: AgentState) -> AgentState:
                       f"Section: {section_name}", f"ERROR: {str(e)}",
                       (time.time() - t0) * 1000, {"error": True})
 
-    state["section_summaries"] = section_summaries
-    return state
+    return {"section_summaries": section_summaries}
 
 
-async def generate_executive_summary_node(state: AgentState) -> AgentState:
+async def generate_executive_summary_node(state: AgentState) -> dict:
     """Node: Generate final executive summary from all section summaries."""
     config = state["llm_config"]
     llm = create_llm(config)
@@ -248,9 +249,7 @@ async def generate_executive_summary_node(state: AgentState) -> AgentState:
               f"Combined {len(section_summaries)} section summaries",
               exec_summary[:300], duration)
 
-    state["executive_summary"] = exec_summary
-    state["all_summaries_text"] = all_summaries_text
-    return state
+    return {"executive_summary": exec_summary, "all_summaries_text": all_summaries_text}
 
 
 # ─── Build the Graph ──────────────────────────────────────────────────
