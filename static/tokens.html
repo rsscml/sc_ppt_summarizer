@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Token Usage — SC Summarizer</title>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600&family=Instrument+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --white: #ffffff; --bg: #fafafa; --surface-2: #f5f5f4; --surface-3: #eeeded;
+    --border: #e5e4e2; --text: #1a1a1a; --text-2: #3d3d3d; --text-dim: #6b6b6b; --text-muted: #9a9a9a;
+    --accent: #2c5282; --accent-light: #edf2f7;
+    --green: #276749; --green-bg: #f0fff4;
+    --amber: #975a16; --amber-bg: #fefcbf;
+    --purple: #6b46c1; --purple-bg: #faf5ff;
+    --serif: 'Source Serif 4', Georgia, serif;
+    --sans: 'Instrument Sans', -apple-system, sans-serif;
+    --mono: 'IBM Plex Mono', monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { font-size: 15px; }
+  body { font-family: var(--sans); background: var(--bg); color: var(--text); min-height: 100vh; -webkit-font-smoothing: antialiased; }
+
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 32px; height: 52px; background: var(--white); border-bottom: 1px solid var(--border);
+  }
+  .topbar-brand { display: flex; align-items: center; gap: 10px; font-family: var(--serif); font-weight: 600; font-size: 16px; letter-spacing: -0.03em; }
+  .topbar-brand .mark { width: 28px; height: 28px; border-radius: 6px; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-family: var(--sans); font-weight: 700; font-size: 13px; }
+  .topbar-nav { display: flex; gap: 2px; }
+  .topbar-nav a { padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; color: var(--text-dim); text-decoration: none; transition: all 0.15s; }
+  .topbar-nav a:hover { background: var(--surface-2); color: var(--text); }
+  .topbar-nav a.active { background: var(--accent-light); color: var(--accent); }
+
+  .container { max-width: 1060px; margin: 0 auto; padding: 28px 32px; }
+  .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+  .page-header h1 { font-family: var(--serif); font-size: 24px; font-weight: 600; letter-spacing: -0.03em; }
+  .btn-sm { padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; border: 1px solid var(--border); cursor: pointer; background: var(--white); color: var(--text-dim); font-family: var(--sans); transition: all 0.15s; }
+  .btn-sm:hover { border-color: var(--accent); color: var(--accent); }
+
+  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .stat-card { background: var(--white); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+  .stat-card .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+  .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; font-family: var(--mono); letter-spacing: -0.03em; }
+  .stat-card .value.accent { color: var(--accent); }
+  .stat-card .value.green { color: var(--green); }
+  .stat-card .value.amber { color: var(--amber); }
+  .stat-card .value.purple { color: var(--purple); }
+
+  .chart-card { background: var(--white); border: 1px solid var(--border); border-radius: 10px; padding: 22px; margin-bottom: 24px; }
+  .chart-card h3 { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 18px; }
+  .bar-chart { display: flex; align-items: flex-end; gap: 5px; height: 150px; }
+  .bar-col { display: flex; flex-direction: column; align-items: center; flex: 1; gap: 4px; height: 100%; justify-content: flex-end; }
+  .bar-stack { width: 100%; max-width: 46px; display: flex; flex-direction: column-reverse; border-radius: 4px 4px 0 0; overflow: hidden; }
+  .bar-prompt { background: var(--accent); }
+  .bar-completion { background: var(--green); }
+  .bar-label { font-size: 9px; color: var(--text-muted); font-family: var(--mono); text-align: center; max-width: 56px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-value { font-size: 10px; color: var(--text-dim); font-family: var(--mono); }
+  .chart-legend { display: flex; gap: 18px; margin-top: 14px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
+  .legend-dot { width: 10px; height: 10px; border-radius: 3px; }
+
+  .filter-bar { display: flex; gap: 8px; margin-bottom: 16px; }
+  .filter-bar select {
+    padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--white); color: var(--text); font-family: var(--sans); font-size: 13px; outline: none;
+  }
+
+  .table-wrap { background: var(--white); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 11px 16px; text-align: left; }
+  th { background: var(--surface-2); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); border-bottom: 1px solid var(--border); }
+  td { border-bottom: 1px solid var(--surface-3); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--bg); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .text-right { text-align: right; }
+  .step-badge { display: inline-block; padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 500; font-family: var(--mono); background: var(--surface-2); color: var(--text-dim); }
+  .tok-p { color: var(--accent); }
+  .tok-c { color: var(--green); }
+  .tok-t { color: var(--amber); font-weight: 600; }
+
+  .empty-state { text-align: center; padding: 64px 20px; color: var(--text-muted); }
+  .empty-state .em { font-size: 36px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-brand"><div class="mark">SC</div><span>Supply Chain Summarizer</span></div>
+  <div class="topbar-nav">
+    <a href="/">Summarizer</a>
+    <a href="/tracing">Traces</a>
+    <a href="/tokens" class="active">Token Usage</a>
+  </div>
+</div>
+
+<div class="container">
+  <div class="page-header">
+    <h1>Token Usage</h1>
+    <button class="btn-sm" onclick="load()">Refresh</button>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-card"><div class="label">Total Tokens</div><div class="value amber" id="sTotal">&mdash;</div></div>
+    <div class="stat-card"><div class="label">Prompt Tokens</div><div class="value accent" id="sPrompt">&mdash;</div></div>
+    <div class="stat-card"><div class="label">Completion Tokens</div><div class="value green" id="sCompl">&mdash;</div></div>
+    <div class="stat-card"><div class="label">API Calls</div><div class="value purple" id="sCalls">&mdash;</div></div>
+  </div>
+
+  <div class="chart-card">
+    <h3>Tokens by Step</h3>
+    <div class="bar-chart" id="barChart"></div>
+    <div class="chart-legend">
+      <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div>Prompt</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>Completion</div>
+    </div>
+  </div>
+
+  <div class="filter-bar">
+    <select id="filterSession" onchange="load()"><option value="">All Sessions</option></select>
+  </div>
+
+  <div id="tableContainer">
+    <div class="empty-state"><div class="em">&#x1F4CA;</div><p>No token usage recorded yet.</p></div>
+  </div>
+</div>
+
+<script>
+  async function load() {
+    const sf = document.getElementById('filterSession').value;
+    const url = sf ? `/api/tokens?session_id=${sf}` : '/api/tokens';
+    try {
+      const data = await (await fetch(url)).json();
+      const e = data.entries, t = data.totals;
+      document.getElementById('sTotal').textContent = t.total_tokens.toLocaleString();
+      document.getElementById('sPrompt').textContent = t.prompt_tokens.toLocaleString();
+      document.getElementById('sCompl').textContent = t.completion_tokens.toLocaleString();
+      document.getElementById('sCalls').textContent = t.entry_count;
+
+      // Session filter
+      const sel = document.getElementById('filterSession');
+      const cur = sel.value;
+      const sessions = [...new Set(e.map(x => x.session_id))];
+      sel.innerHTML = '<option value="">All Sessions</option>';
+      sessions.forEach(s => { sel.innerHTML += `<option value="${s}" ${s===cur?'selected':''}>${s.slice(0,8)}...</option>`; });
+
+      // Chart
+      const chart = document.getElementById('barChart');
+      if (!e.length) { chart.innerHTML = ''; } else {
+        const mx = Math.max(...e.map(x => x.total_tokens), 1);
+        chart.innerHTML = e.map(x => {
+          const pP = (x.prompt_tokens / mx) * 130;
+          const pC = (x.completion_tokens / mx) * 130;
+          const lb = x.step.replace('section_summary_','S').replace('executive_summary','Exec').replace('refine_summary','Refine');
+          return `<div class="bar-col"><div class="bar-value">${(x.total_tokens/1000).toFixed(1)}k</div><div class="bar-stack"><div class="bar-prompt" style="height:${pP}px"></div><div class="bar-completion" style="height:${pC}px"></div></div><div class="bar-label" title="${x.step}">${lb}</div></div>`;
+        }).join('');
+      }
+
+      // Table
+      if (!e.length) {
+        document.getElementById('tableContainer').innerHTML = '<div class="empty-state"><div class="em">&#x1F4CA;</div><p>No data.</p></div>';
+      } else {
+        let h = '<div class="table-wrap"><table><thead><tr><th>Time</th><th>Step</th><th>Model</th><th class="text-right">Prompt</th><th class="text-right">Completion</th><th class="text-right">Total</th></tr></thead><tbody>';
+        e.slice().reverse().forEach(x => {
+          h += `<tr><td class="mono" style="color:var(--text-muted)">${new Date(x.timestamp).toLocaleTimeString()}</td><td><span class="step-badge">${x.step}</span></td><td class="mono" style="color:var(--text-dim)">${x.model||'\u2014'}</td><td class="mono text-right tok-p">${x.prompt_tokens.toLocaleString()}</td><td class="mono text-right tok-c">${x.completion_tokens.toLocaleString()}</td><td class="mono text-right tok-t">${x.total_tokens.toLocaleString()}</td></tr>`;
+        });
+        h += '</tbody></table></div>';
+        document.getElementById('tableContainer').innerHTML = h;
+      }
+    } catch (err) { console.error(err); }
+  }
+
+  load();
+  setInterval(load, 10000);
+</script>
+</body>
+</html>
