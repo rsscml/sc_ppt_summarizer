@@ -6,6 +6,7 @@ Configuration loaded from .env file.
 """
 
 import os
+import json
 import uuid
 import shutil
 from pathlib import Path
@@ -17,9 +18,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
 from ppt_parser import parse_presentation
+from glossary import load_glossary_dir, load_glossary_file, normalise_json, render_glossary_for_prompt
 from agent import (
     build_summarization_graph,
     refine_summary,
+    refine_email,
     token_usage_log,
     trace_log,
     AgentState,
@@ -35,6 +38,22 @@ LLM_CONFIG = {
     "azure_deployment": os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
     "api_version": os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
 }
+
+# ─── Load glossary ────────────────────────────────────────────────────
+
+GLOSSARY_DIR = Path(os.getenv("GLOSSARY_DIR", str(Path(__file__).parent / "glossary")))
+GLOSSARY_DIR.mkdir(exist_ok=True)
+
+_glossary_data = load_glossary_dir(str(GLOSSARY_DIR))
+glossary_entries: dict = _glossary_data.get("entries", {})
+glossary_meta: list = _glossary_data.get("files_loaded", [])
+glossary_prompt_text: str = render_glossary_for_prompt(glossary_entries)
+
+print(f"📖 Glossary: {len(glossary_entries)} entries loaded from {len(glossary_meta)} file(s) in {GLOSSARY_DIR}")
+if glossary_entries:
+    for fm in glossary_meta:
+        status = f"{fm['entries']} entries" if not fm.get("error") else f"ERROR: {fm['error']}"
+        print(f"   • {fm['file']}: {status}")
 
 
 def _validate_config():
@@ -123,11 +142,13 @@ async def upload_ppt(file: UploadFile = File(...)):
     sessions[session_id] = {
         "session_id": session_id,
         "llm_config": LLM_CONFIG,
+        "glossary_context": glossary_prompt_text,
         "filename": file.filename,
         "file_path": str(file_path),
         "parsed_ppt": parsed,
         "section_summaries": None,
         "executive_summary": None,
+        "email_summary": None,
         "all_summaries_text": None,
         "conversation_history": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -159,8 +180,10 @@ async def summarize(session_id: str = Form(...)):
         "session_id": session_id,
         "llm_config": sess["llm_config"],
         "parsed_ppt": sess["parsed_ppt"],
+        "glossary_context": sess.get("glossary_context", ""),
         "section_summaries": [],
         "executive_summary": "",
+        "email_summary": "",
         "all_summaries_text": "",
     }
 
@@ -171,6 +194,7 @@ async def summarize(session_id: str = Form(...)):
 
     sess["section_summaries"] = final_state["section_summaries"]
     sess["executive_summary"] = final_state["executive_summary"]
+    sess["email_summary"] = final_state["email_summary"]
     sess["all_summaries_text"] = final_state["all_summaries_text"]
     sess["conversation_history"].append({
         "role": "assistant",
@@ -182,6 +206,7 @@ async def summarize(session_id: str = Form(...)):
     return {
         "session_id": session_id,
         "executive_summary": final_state["executive_summary"],
+        "email_summary": final_state["email_summary"],
         "section_summaries": [
             {"section_name": s["section_name"], "summary": s["summary"]}
             for s in final_state["section_summaries"]
@@ -190,35 +215,57 @@ async def summarize(session_id: str = Form(...)):
 
 
 @app.post("/api/refine")
-async def refine(session_id: str = Form(...), instruction: str = Form(...)):
+async def refine(
+    session_id: str = Form(...),
+    instruction: str = Form(...),
+    target: str = Form("slides"),
+):
+    """Refine the executive summary or email summary. target = 'slides' | 'email'."""
     sess = get_session(session_id)
 
-    if not sess.get("executive_summary"):
-        raise HTTPException(status_code=400, detail="No summary to refine. Run /api/summarize first.")
+    if target == "email":
+        if not sess.get("email_summary"):
+            raise HTTPException(status_code=400, detail="No email summary to refine.")
+    else:
+        if not sess.get("executive_summary"):
+            raise HTTPException(status_code=400, detail="No summary to refine. Run /api/summarize first.")
 
     sess["conversation_history"].append({
-        "role": "user", "content": instruction,
+        "role": "user", "content": f"[{target}] {instruction}",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
     try:
-        refined = await refine_summary(
-            session_id=session_id,
-            llm_config=sess["llm_config"],
-            current_summary=sess["executive_summary"],
-            section_summaries_text=sess["all_summaries_text"],
-            user_instruction=instruction,
-        )
+        if target == "email":
+            refined = await refine_email(
+                session_id=session_id,
+                llm_config=sess["llm_config"],
+                current_email=sess["email_summary"],
+                section_summaries_text=sess["all_summaries_text"],
+                user_instruction=instruction,
+                glossary_context=sess.get("glossary_context", ""),
+            )
+            sess["email_summary"] = refined
+        else:
+            refined = await refine_summary(
+                session_id=session_id,
+                llm_config=sess["llm_config"],
+                current_summary=sess["executive_summary"],
+                section_summaries_text=sess["all_summaries_text"],
+                user_instruction=instruction,
+                glossary_context=sess.get("glossary_context", ""),
+            )
+            sess["executive_summary"] = refined
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Refinement failed: {str(e)}")
 
-    sess["executive_summary"] = refined
     sess["conversation_history"].append({
         "role": "assistant", "content": refined,
-        "timestamp": datetime.now(timezone.utc).isoformat(), "type": "refined_summary"
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": f"refined_{target}"
     })
 
-    return {"session_id": session_id, "executive_summary": refined}
+    return {"session_id": session_id, "target": target, "content": refined}
 
 
 @app.get("/api/session/{session_id}")
@@ -257,6 +304,88 @@ async def list_sessions():
         if isinstance(v, dict) and "session_id" in v:
             result.append({"session_id": v["session_id"], "filename": v.get("filename"), "created_at": v.get("created_at"), "has_summary": v.get("executive_summary") is not None})
     return {"sessions": result}
+
+
+# ─── Routes: Glossary ────────────────────────────────────────────────
+
+@app.get("/api/glossary")
+async def get_glossary():
+    """Return current glossary entries and metadata."""
+    # Group by category for display
+    by_category: dict[str, list] = {}
+    for abbr, info in sorted(glossary_entries.items()):
+        cat = info.get("category", "general")
+        by_category.setdefault(cat, []).append({"abbr": abbr, "meaning": info["meaning"]})
+
+    return {
+        "total_entries": len(glossary_entries),
+        "files_loaded": glossary_meta,
+        "categories": {cat: len(items) for cat, items in by_category.items()},
+        "entries_by_category": by_category,
+    }
+
+
+@app.post("/api/glossary/upload")
+async def upload_glossary(file: UploadFile = File(...)):
+    """Upload an additional glossary JSON file. Merges into the active glossary."""
+    global glossary_entries, glossary_prompt_text, glossary_meta
+
+    if not file.filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="Please upload a .json file.")
+
+    file_path = GLOSSARY_DIR / file.filename
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    try:
+        new_entries = load_glossary_file(str(file_path))
+    except Exception as e:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Failed to parse glossary JSON: {str(e)}")
+
+    # Merge into global glossary
+    added_count = len([k for k in new_entries if k not in glossary_entries])
+    updated_count = len([k for k in new_entries if k in glossary_entries])
+    glossary_entries.update(new_entries)
+    glossary_prompt_text = render_glossary_for_prompt(glossary_entries)
+    glossary_meta.append({"file": file.filename, "entries": len(new_entries)})
+
+    # Update any active sessions with the new glossary
+    for sess in sessions.values():
+        if isinstance(sess, dict) and "glossary_context" in sess:
+            sess["glossary_context"] = glossary_prompt_text
+
+    return {
+        "filename": file.filename,
+        "new_entries": added_count,
+        "updated_entries": updated_count,
+        "total_entries": len(glossary_entries),
+    }
+
+
+@app.delete("/api/glossary/{filename}")
+async def delete_glossary_file(filename: str):
+    """Remove a glossary file and reload all remaining files."""
+    global glossary_entries, glossary_prompt_text, glossary_meta
+
+    file_path = GLOSSARY_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Glossary file not found: {filename}")
+
+    file_path.unlink()
+
+    # Reload everything from the directory
+    _data = load_glossary_dir(str(GLOSSARY_DIR))
+    glossary_entries = _data.get("entries", {})
+    glossary_meta = _data.get("files_loaded", [])
+    glossary_prompt_text = render_glossary_for_prompt(glossary_entries)
+
+    # Update active sessions
+    for sess in sessions.values():
+        if isinstance(sess, dict) and "glossary_context" in sess:
+            sess["glossary_context"] = glossary_prompt_text
+
+    return {"deleted": filename, "total_entries": len(glossary_entries)}
 
 
 if __name__ == "__main__":

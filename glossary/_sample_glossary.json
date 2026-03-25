@@ -1,0 +1,72 @@
+{
+  "locations": {
+    "BHV": "Bremerhaven plant",
+    "BOG": "Bogen plant (Bavaria)",
+    "HAN": "Hannover plant",
+    "WOB": "Wolfsburg facility",
+    "SHA": "Shanghai plant (China)",
+    "PUN": "Pune plant (India)",
+    "ATL": "Atlanta distribution center (US)"
+  },
+  "business_entities": {
+    "CVS": "Commercial Vehicle Systems division",
+    "IVS": "Industrial Vehicle Systems division",
+    "ATS": "Aftermarket & Trailer Systems",
+    "OES": "Original Equipment Solutions",
+    "GBS": "Global Business Services"
+  },
+  "roles_and_functions": {
+    "KAM": "Key Account Manager",
+    "SCM": "Supply Chain Management",
+    "MP": "Material Planner",
+    "BU": "Business Unit",
+    "FM": "Force Majeure",
+    "PM": "Plant Manager",
+    "VP-SCM": "Vice President Supply Chain Management",
+    "COO": "Chief Operating Officer"
+  },
+  "supply_chain_terms": {
+    "RAG": "Red-Amber-Green status indicator",
+    "MOQ": "Minimum Order Quantity",
+    "LT": "Lead Time",
+    "WOS": "Weeks of Supply (inventory coverage)",
+    "DOS": "Days of Supply",
+    "FTE": "Full-Time Equivalent (workforce headcount)",
+    "OTD": "On-Time Delivery",
+    "OTIF": "On-Time In-Full delivery",
+    "BOM": "Bill of Materials",
+    "PPM": "Parts Per Million (quality metric)",
+    "SOP": "Start of Production",
+    "EOP": "End of Production",
+    "EOL": "End of Life",
+    "RFQ": "Request for Quotation",
+    "PO": "Purchase Order",
+    "GR": "Goods Receipt",
+    "MRP": "Material Requirements Planning",
+    "S&OP": "Sales and Operations Planning",
+    "VMI": "Vendor Managed Inventory"
+  },
+  "customers_and_oems": {
+    "DAF": "DAF Trucks (PACCAR subsidiary)",
+    "MAN": "MAN Truck & Bus (Traton Group)",
+    "SCAN": "Scania (Traton Group)",
+    "VNI": "Volvo Group North & South America",
+    "IVE": "Iveco Group",
+    "DAI": "Daimler Truck",
+    "KW": "Kenworth (PACCAR subsidiary)",
+    "PB": "Peterbilt (PACCAR subsidiary)"
+  },
+  "finance_and_kpis": {
+    "EBIT": "Earnings Before Interest and Taxes",
+    "EBITDA": "Earnings Before Interest, Taxes, Depreciation and Amortization",
+    "COGS": "Cost of Goods Sold",
+    "CAPEX": "Capital Expenditure",
+    "OPEX": "Operational Expenditure",
+    "YoY": "Year over Year comparison",
+    "QoQ": "Quarter over Quarter comparison",
+    "WoW": "Week over Week comparison",
+    "BDG": "Budget",
+    "FC": "Forecast",
+    "ACT": "Actual"
+  }
+}

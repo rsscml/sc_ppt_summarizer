@@ -293,6 +293,98 @@
   .chat-row textarea:focus { border-color: var(--accent); }
   .chat-row textarea::placeholder { color: var(--text-muted); }
 
+  /* ── Output tabs ──────────────────── */
+  .tab-bar {
+    display: flex; gap: 0; border-bottom: 1px solid var(--border);
+    background: var(--white); padding: 0 32px;
+  }
+  .tab-bar .tab {
+    padding: 12px 20px; font-size: 13px; font-weight: 600;
+    color: var(--text-muted); cursor: pointer; border: none; background: none;
+    font-family: var(--sans); position: relative; transition: color 0.15s;
+  }
+  .tab-bar .tab:hover { color: var(--text-dim); }
+  .tab-bar .tab.active { color: var(--accent); }
+  .tab-bar .tab.active::after {
+    content: ''; position: absolute; bottom: -1px; left: 16px; right: 16px;
+    height: 2px; background: var(--accent); border-radius: 1px;
+  }
+  .tab-bar .tab .tab-dot {
+    display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green); margin-left: 6px; vertical-align: middle;
+    opacity: 0; transition: opacity 0.2s;
+  }
+  .tab-bar .tab .tab-dot.has-content { opacity: 1; }
+
+  /* ── Glossary panel ───────────────── */
+  .glossary-status {
+    background: var(--surface-2); border-radius: 8px; padding: 12px;
+  }
+  .glossary-stat-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 3px 0; font-size: 12px;
+  }
+  .glossary-stat-label { color: var(--text-dim); }
+  .glossary-stat-value { font-family: var(--mono); font-weight: 600; color: var(--text); font-size: 12px; }
+  .glossary-categories {
+    margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px;
+  }
+  .glossary-cat-tag {
+    font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 4px;
+    background: var(--accent-light); color: var(--accent);
+    font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.03em;
+  }
+  .glossary-file-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+  .glossary-file-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 10px; border-radius: 6px;
+    background: var(--white); border: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .glossary-file-item .gf-name {
+    font-family: var(--mono); font-size: 11px; color: var(--text-2);
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .glossary-file-item .gf-count {
+    font-family: var(--mono); font-size: 10px; color: var(--text-muted);
+    margin: 0 8px;
+  }
+  .glossary-file-item .gf-del {
+    background: none; border: none; cursor: pointer; font-size: 13px;
+    color: var(--text-muted); padding: 0 2px; line-height: 1;
+    transition: color 0.15s;
+  }
+  .glossary-file-item .gf-del:hover { color: var(--red); }
+  .btn-secondary {
+    background: var(--surface-2); color: var(--text-dim); border: 1px solid var(--border);
+    font-size: 12px; font-weight: 600; padding: 8px 14px; border-radius: 8px;
+    transition: all 0.15s; font-family: var(--sans);
+  }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+  .glossary-peek-btn {
+    display: block; width: 100%; text-align: left;
+    font-size: 12px; color: var(--accent); cursor: pointer;
+    padding: 8px 0 0; border: none; background: none;
+    font-family: var(--sans); font-weight: 500;
+  }
+  .glossary-peek-btn:hover { text-decoration: underline; }
+  .glossary-peek {
+    display: none; margin-top: 6px;
+    max-height: 200px; overflow-y: auto;
+    background: var(--white); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px;
+    font-size: 11px; font-family: var(--mono);
+    color: var(--text-dim); line-height: 1.7;
+  }
+  .glossary-peek.visible { display: block; }
+  .glossary-peek .gp-cat {
+    font-weight: 600; color: var(--accent); text-transform: uppercase;
+    font-size: 10px; letter-spacing: 0.06em; margin-top: 6px;
+  }
+  .glossary-peek .gp-cat:first-child { margin-top: 0; }
+  .glossary-peek .gp-entry { padding-left: 8px; }
+  .glossary-peek .gp-abbr { font-weight: 600; color: var(--text-2); }
+
   /* ── Toast ───────────────────────── */
   .toast {
     position: fixed; bottom: 24px; right: 24px;
@@ -342,6 +434,30 @@
       </div>
     </div>
 
+    <div class="sidebar-section" id="glossaryPanel">
+      <div class="sidebar-label">Company Glossary</div>
+      <div class="glossary-status" id="glossaryStatus">
+        <div class="glossary-stat-row">
+          <span class="glossary-stat-label">Entries loaded</span>
+          <span class="glossary-stat-value" id="glossaryCount">—</span>
+        </div>
+        <div class="glossary-stat-row">
+          <span class="glossary-stat-label">Source files</span>
+          <span class="glossary-stat-value" id="glossaryFiles">—</span>
+        </div>
+        <div class="glossary-categories" id="glossaryCategories"></div>
+      </div>
+      <div class="glossary-file-list" id="glossaryFileList"></div>
+      <div style="margin-top:10px; display:flex; gap:6px;">
+        <label class="btn btn-secondary btn-full" style="cursor:pointer; text-align:center;">
+          + Add glossary .json
+          <input type="file" accept=".json" style="display:none" onchange="uploadGlossary(this)">
+        </label>
+      </div>
+      <button class="glossary-peek-btn" id="glossaryPeekBtn" onclick="toggleGlossaryPeek()" style="display:none">Preview entries ▸</button>
+      <div class="glossary-peek" id="glossaryPeek"></div>
+    </div>
+
     <div class="sidebar-section" id="sectionsPanel" style="display:none">
       <div class="sidebar-label">Detected Sections</div>
       <div class="sections-list" id="sectionsList"></div>
@@ -360,8 +476,20 @@
   <!-- Main -->
   <div class="main-panel">
     <div class="main-header">
-      <h2>Executive Summary</h2>
+      <h2>Output</h2>
       <span class="status-pill idle" id="statusPill">Waiting</span>
+    </div>
+
+    <div class="tab-bar" id="tabBar" style="display:none">
+      <button class="tab active" data-tab="slides" onclick="switchTab('slides')">
+        Slide Summary <span class="tab-dot" id="dotSlides"></span>
+      </button>
+      <button class="tab" data-tab="email" onclick="switchTab('email')">
+        Email Summary <span class="tab-dot" id="dotEmail"></span>
+      </button>
+      <button class="tab" data-tab="sections" onclick="switchTab('sections')">
+        Section Details
+      </button>
     </div>
 
     <div class="progress-bar" id="progressBar">
@@ -373,7 +501,7 @@
       <div class="welcome" id="welcomeScreen">
         <div class="welcome-inner">
           <h2>Global Supply Chain<br>Status Report Summarizer</h2>
-          <p>Upload your supply chain status deck and get a crisp 2–4 slide executive summary ready for the Board.</p>
+          <p>Upload your supply chain status deck and get a crisp 2–4 slide executive summary and a structured email update — ready for the Board.</p>
           <div class="steps">
             <div class="step">
               <div class="step-num">1</div>
@@ -381,22 +509,24 @@
             </div>
             <div class="step">
               <div class="step-num">2</div>
-              <div class="step-text">Review the detected sections, then generate the summary</div>
+              <div class="step-text">Review the detected sections, then generate both outputs</div>
             </div>
             <div class="step">
               <div class="step-num">3</div>
-              <div class="step-text">Refine the output via conversation until it's board-ready</div>
+              <div class="step-text">Switch between Slides and Email tabs — refine each via chat</div>
             </div>
           </div>
         </div>
       </div>
 
-      <div id="summaryOutput" style="display:none"></div>
+      <div id="slidesOutput" class="tab-content" style="display:none"></div>
+      <div id="emailOutput" class="tab-content" style="display:none"></div>
+      <div id="sectionsOutput" class="tab-content" style="display:none"></div>
     </div>
 
     <div class="chat-bar" id="chatBar">
       <div class="chat-row">
-        <textarea id="chatInput" rows="1" placeholder="Refine the summary... e.g. 'Focus more on cost impact' or 'Add supplier names to slide 2'"></textarea>
+        <textarea id="chatInput" rows="1" placeholder="Refine the active output... e.g. 'Focus more on cost impact' or 'Add supplier names'"></textarea>
         <button class="btn btn-primary" id="btnRefine" onclick="sendRefine()">Refine</button>
       </div>
     </div>
@@ -409,6 +539,7 @@
 <script>
   let sessionId = null;
   let selectedFile = null;
+  let activeTab = 'slides'; // 'slides' | 'email' | 'sections'
 
   function toast(msg, type = '') {
     const t = document.getElementById('toast');
@@ -452,6 +583,26 @@
     return html;
   }
 
+  // ── Tabs ──
+  function switchTab(tab) {
+    activeTab = tab;
+    document.querySelectorAll('.tab-bar .tab').forEach(t => {
+      t.classList.toggle('active', t.dataset.tab === tab);
+    });
+    document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+    const target = document.getElementById(tab + 'Output');
+    if (target) target.style.display = 'block';
+
+    // Update chat placeholder based on active tab
+    const input = document.getElementById('chatInput');
+    if (tab === 'slides') input.placeholder = "Refine slide summary... e.g. 'Focus more on cost impact'";
+    else if (tab === 'email') input.placeholder = "Refine email... e.g. 'Make the tone more urgent' or 'Add logistics details'";
+    else input.placeholder = "Switch to Slides or Email tab to refine";
+
+    // Disable refine on sections tab
+    document.getElementById('btnRefine').disabled = (tab === 'sections');
+  }
+
   // ── File handling ──
   function handleFile(input) {
     if (input.files.length) {
@@ -478,7 +629,6 @@
   // ── Upload ──
   async function uploadFile() {
     if (!selectedFile) return;
-
     const btn = document.getElementById('btnUpload');
     btn.disabled = true; btn.textContent = 'Parsing...';
     setStatus('Parsing', 'processing');
@@ -524,15 +674,16 @@
     const btn = document.getElementById('btnSummarize');
     btn.disabled = true; btn.textContent = 'Summarizing...';
     setStatus('Processing', 'processing');
-    showProgress(40, 'Summarizing sections with LLM (this may take 1-2 min)...');
+    showProgress(35, 'Summarizing sections with LLM (this may take 1-2 min)...');
 
     document.getElementById('welcomeScreen').style.display = 'none';
-    const out = document.getElementById('summaryOutput');
-    out.style.display = 'block';
-    out.innerHTML = '<p style="color:var(--text-muted);padding:20px 0;">Generating executive summary — summarizing each section independently then synthesizing...</p>';
+    document.getElementById('tabBar').style.display = 'flex';
+    const slidesOut = document.getElementById('slidesOutput');
+    slidesOut.style.display = 'block';
+    slidesOut.innerHTML = '<p style="color:var(--text-muted);padding:20px 0;">Generating slide summary and email update — processing each section then synthesizing...</p>';
 
-    let pct = 40;
-    const iv = setInterval(() => { if (pct < 90) { pct += 3; showProgress(pct, 'Processing sections...'); } }, 2000);
+    let pct = 35;
+    const iv = setInterval(() => { if (pct < 90) { pct += 2; showProgress(pct, 'Processing sections...'); } }, 2500);
 
     const fd = new FormData();
     fd.append('session_id', sessionId);
@@ -546,37 +697,44 @@
       showProgress(100, 'Done');
       setStatus('Ready', 'ready');
 
-      let html = '<div class="summary-block">' + mdToHtml(data.executive_summary) + '</div>';
-      html += '<button class="section-toggle" onclick="toggleSections()">&#x25B6; Show section-level summaries</button>';
-      html += '<div class="section-details" id="sectionDetails">';
-      data.section_summaries.forEach(s => {
-        html += `<div class="section-detail-card"><h4>${s.section_name}</h4><div class="content">${s.summary}</div></div>`;
-      });
-      html += '</div>';
+      // Slides tab
+      slidesOut.innerHTML = '<div class="summary-block">' + mdToHtml(data.executive_summary) + '</div>';
 
-      out.innerHTML = html;
+      // Email tab
+      const emailOut = document.getElementById('emailOutput');
+      emailOut.innerHTML = '<div class="summary-block">' + mdToHtml(data.email_summary) + '</div>';
+
+      // Sections tab
+      const secOut = document.getElementById('sectionsOutput');
+      let secHtml = '';
+      data.section_summaries.forEach(s => {
+        secHtml += `<div class="section-detail-card"><h4>${s.section_name}</h4><div class="content">${s.summary}</div></div>`;
+      });
+      secOut.innerHTML = secHtml;
+
+      // Green dots
+      document.getElementById('dotSlides').classList.add('has-content');
+      document.getElementById('dotEmail').classList.add('has-content');
+
+      // Show chat bar and ensure slides tab is active
       document.getElementById('chatBar').classList.add('visible');
-      toast('Executive summary generated', 'success');
+      switchTab('slides');
+
+      toast('Slide summary and email generated', 'success');
       setTimeout(hideProgress, 1500);
     } catch (e) {
       clearInterval(iv);
       toast(e.message, 'error');
       setStatus('Error', 'idle');
       hideProgress();
-      out.innerHTML = `<p style="color:var(--red)">Error: ${e.message}</p>`;
+      slidesOut.innerHTML = `<p style="color:var(--red)">Error: ${e.message}</p>`;
     }
     btn.disabled = false; btn.textContent = 'Generate Executive Summary';
   }
 
-  function toggleSections() {
-    const el = document.getElementById('sectionDetails');
-    const btn = el.previousElementSibling;
-    el.classList.toggle('visible');
-    btn.innerHTML = el.classList.contains('visible') ? '&#x25BC; Hide section-level summaries' : '&#x25B6; Show section-level summaries';
-  }
-
   // ── Refine ──
   async function sendRefine() {
+    if (activeTab === 'sections') return;
     const input = document.getElementById('chatInput');
     const instruction = input.value.trim();
     if (!instruction || !sessionId) return;
@@ -586,27 +744,32 @@
     btn.disabled = true; btn.textContent = '...';
     setStatus('Refining', 'processing');
 
-    const area = document.getElementById('summaryOutput');
-    area.innerHTML += `<div class="user-msg"><div class="label">You</div>${instruction}</div>`;
+    const target = activeTab; // 'slides' or 'email'
+    const outputEl = document.getElementById(target + 'Output');
+
+    // Show user message
+    outputEl.innerHTML += `<div class="user-msg"><div class="label">You → ${target === 'slides' ? 'Slides' : 'Email'}</div>${instruction}</div>`;
 
     const fd = new FormData();
     fd.append('session_id', sessionId);
     fd.append('instruction', instruction);
+    fd.append('target', target);
 
     try {
       const res = await fetch('/api/refine', { method: 'POST', body: fd });
       if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Refinement failed'); }
       const data = await res.json();
 
-      const oldBlock = area.querySelector('.summary-block');
+      // Replace the summary block in the active tab
+      const oldBlock = outputEl.querySelector('.summary-block');
       if (oldBlock) oldBlock.remove();
       const nb = document.createElement('div');
       nb.className = 'summary-block';
-      nb.innerHTML = mdToHtml(data.executive_summary);
-      area.prepend(nb);
+      nb.innerHTML = mdToHtml(data.content);
+      outputEl.prepend(nb);
 
       setStatus('Ready', 'ready');
-      toast('Summary refined', 'success');
+      toast(`${target === 'slides' ? 'Slide summary' : 'Email'} refined`, 'success');
     } catch (e) {
       toast(e.message, 'error');
       setStatus('Error', 'idle');
@@ -621,6 +784,91 @@
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 120) + 'px';
   });
+
+  // ── Glossary ──
+  let glossaryData = null;
+
+  async function loadGlossary() {
+    try {
+      const res = await fetch('/api/glossary');
+      const data = await res.json();
+      glossaryData = data;
+
+      document.getElementById('glossaryCount').textContent = data.total_entries;
+      document.getElementById('glossaryFiles').textContent = data.files_loaded.length;
+
+      const cats = document.getElementById('glossaryCategories');
+      cats.innerHTML = '';
+      for (const [cat, count] of Object.entries(data.categories || {})) {
+        cats.innerHTML += `<span class="glossary-cat-tag">${cat} (${count})</span>`;
+      }
+
+      const fl = document.getElementById('glossaryFileList');
+      fl.innerHTML = '';
+      data.files_loaded.forEach(f => {
+        const err = f.error ? ' style="color:var(--red)"' : '';
+        fl.innerHTML += `<div class="glossary-file-item">
+          <span class="gf-name"${err}>${f.file}</span>
+          <span class="gf-count">${f.entries}</span>
+          <button class="gf-del" title="Remove" onclick="deleteGlossaryFile('${f.file}')">&times;</button>
+        </div>`;
+      });
+
+      const peekBtn = document.getElementById('glossaryPeekBtn');
+      peekBtn.style.display = data.total_entries > 0 ? 'block' : 'none';
+
+      const peek = document.getElementById('glossaryPeek');
+      let peekHtml = '';
+      for (const [cat, entries] of Object.entries(data.entries_by_category || {})) {
+        peekHtml += `<div class="gp-cat">${cat}</div>`;
+        entries.forEach(e => {
+          peekHtml += `<div class="gp-entry"><span class="gp-abbr">${e.abbr}</span> = ${e.meaning}</div>`;
+        });
+      }
+      peek.innerHTML = peekHtml;
+    } catch (e) {
+      console.error('Failed to load glossary:', e);
+    }
+  }
+
+  async function uploadGlossary(input) {
+    if (!input.files.length) return;
+    const file = input.files[0];
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const res = await fetch('/api/glossary/upload', { method: 'POST', body: fd });
+      if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Upload failed'); }
+      const data = await res.json();
+      toast(`Glossary loaded: ${data.new_entries} new, ${data.updated_entries} updated (${data.total_entries} total)`, 'success');
+      loadGlossary();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+    input.value = '';
+  }
+
+  async function deleteGlossaryFile(filename) {
+    if (!confirm(`Remove glossary file "${filename}"?`)) return;
+    try {
+      const res = await fetch(`/api/glossary/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+      if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Delete failed'); }
+      const data = await res.json();
+      toast(`Removed ${filename} (${data.total_entries} entries remaining)`, 'success');
+      loadGlossary();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  }
+
+  function toggleGlossaryPeek() {
+    const peek = document.getElementById('glossaryPeek');
+    const btn = document.getElementById('glossaryPeekBtn');
+    peek.classList.toggle('visible');
+    btn.textContent = peek.classList.contains('visible') ? 'Preview entries ▾' : 'Preview entries ▸';
+  }
+
+  loadGlossary();
 </script>
 </body>
 </html>
