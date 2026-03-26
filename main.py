@@ -13,12 +13,13 @@ from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from ppt_parser import parse_presentation
 from glossary import load_glossary_dir, load_glossary_file, normalise_json, render_glossary_for_prompt
+from docx_export import markdown_to_docx
 from agent import (
     build_summarization_graph,
     refine_summary,
@@ -266,6 +267,40 @@ async def refine(
     })
 
     return {"session_id": session_id, "target": target, "content": refined}
+
+
+@app.get("/api/download")
+async def download_docx(
+    session_id: str = Query(...),
+    target: str = Query("slides"),
+):
+    """Download the slide summary or email summary as a formatted .docx file."""
+    sess = get_session(session_id)
+
+    if target == "email":
+        content = sess.get("email_summary")
+        if not content:
+            raise HTTPException(status_code=400, detail="No email summary available.")
+        title = "Crisis Status Email Summary"
+        filename = "email_summary.docx"
+    else:
+        content = sess.get("executive_summary")
+        if not content:
+            raise HTTPException(status_code=400, detail="No slide summary available.")
+        title = "Executive Summary — Slide Content"
+        filename = "slide_summary.docx"
+
+    # Prefix with source file info
+    source_name = sess.get("filename", "")
+    header = f"Source: {source_name}\n\n---\n\n" if source_name else ""
+
+    buf = markdown_to_docx(header + content, title=title)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/session/{session_id}")

@@ -119,6 +119,10 @@ Sections are only included when substantive data exists in the source PPT — no
 
 Both outputs are independently refinable via the chat bar. The active tab determines which output receives the refinement instruction.
 
+### Download
+
+Each output can be downloaded as a formatted `.docx` Word document via a discrete button in the tab bar. The export preserves all formatting — headings, bold, italic, bullet lists, and section breaks — so the content can be directly pasted into PowerPoint or Outlook without reformatting.
+
 ## Pages
 
 | URL | Description |
@@ -143,6 +147,8 @@ Both outputs are independently refinable via the chat bar. The active tab determ
 
 **Observability** — Every LLM call logs prompt/completion token counts. Every graph node execution is traced with timing, inputs, and outputs. Both are viewable in dedicated dashboards.
 
+**DOCX Export** — Either output can be downloaded as a Word document. The `docx_export.py` module converts the agent's markdown into a styled `.docx` with proper heading levels, bold/italic runs, bulleted lists, and horizontal rules using `python-docx`.
+
 ## File Structure
 
 ```
@@ -152,6 +158,7 @@ supply-chain-summarizer/
 ├── ppt_parser.py                 # PPT extraction & section detection
 ├── agent.py                      # LangGraph agent, prompts, tracing
 ├── glossary.py                   # Glossary loader & prompt renderer
+├── docx_export.py                # Markdown → Word document converter
 ├── requirements.txt
 ├── glossary/                     # Company glossary JSON files
 │   └── _sample_glossary.json     # Example with 58 entries
@@ -172,6 +179,7 @@ supply-chain-summarizer/
 | POST | `/api/upload` | Upload and parse a `.pptx` file |
 | POST | `/api/summarize` | Run the full summarization workflow (slides + email) |
 | POST | `/api/refine` | Refine an output. Form fields: `session_id`, `instruction`, `target` (`slides` or `email`) |
+| GET | `/api/download` | Download output as `.docx`. Query params: `session_id`, `target` (`slides` or `email`) |
 | GET | `/api/session/{id}` | Session metadata |
 | GET | `/api/sessions` | List all sessions |
 

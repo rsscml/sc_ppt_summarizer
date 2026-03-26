@@ -315,6 +315,17 @@
     opacity: 0; transition: opacity 0.2s;
   }
   .tab-bar .tab .tab-dot.has-content { opacity: 1; }
+  .tab-bar .tab-dl {
+    margin-left: auto; padding: 6px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--white);
+    font-size: 12px; font-weight: 500; color: var(--text-muted);
+    cursor: pointer; font-family: var(--sans);
+    display: none; align-items: center; gap: 5px;
+    transition: all 0.15s;
+  }
+  .tab-bar .tab-dl:hover { border-color: var(--accent); color: var(--accent); }
+  .tab-bar .tab-dl.visible { display: inline-flex; }
+  .tab-bar .tab-dl svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
 
   /* ── Glossary panel ───────────────── */
   .glossary-status {
@@ -490,6 +501,10 @@
       <button class="tab" data-tab="sections" onclick="switchTab('sections')">
         Section Details
       </button>
+      <button class="tab-dl" id="btnDownload" onclick="downloadDocx()" title="Download as Word document">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        .docx
+      </button>
     </div>
 
     <div class="progress-bar" id="progressBar">
@@ -601,6 +616,15 @@
 
     // Disable refine on sections tab
     document.getElementById('btnRefine').disabled = (tab === 'sections');
+
+    // Show download button only on slides/email tabs when content exists
+    const dlBtn = document.getElementById('btnDownload');
+    if (tab === 'sections') {
+      dlBtn.classList.remove('visible');
+    } else {
+      const hasContent = document.getElementById(tab + 'Output')?.querySelector('.summary-block');
+      dlBtn.classList.toggle('visible', !!hasContent);
+    }
   }
 
   // ── File handling ──
@@ -784,6 +808,18 @@
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 120) + 'px';
   });
+
+  // ── Download ──
+  function downloadDocx() {
+    if (!sessionId || activeTab === 'sections') return;
+    const url = `/api/download?session_id=${encodeURIComponent(sessionId)}&target=${activeTab}`;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
 
   // ── Glossary ──
   let glossaryData = null;
