@@ -454,9 +454,33 @@ async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(2))
         parsed = filter_by_recency(parsed, history_weeks=history_weeks)
 
     # Generate the PPTX slides
+    #try:
+    #    pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
+    #    buf = generate_gfd_slides(parsed["product_groups"], output_path=pptx_path)
+    #except Exception as e:
+    #    raise HTTPException(status_code=500, detail=f"Failed to generate slides: {str(e)}")
+    # Run LLM interpretation pipeline
+    try:
+        gfd_result = await run_gfd_pipeline(
+            session_id=session_id,
+            llm_config=LLM_CONFIG,
+            parsed_data=parsed,
+            glossary_context=glossary_prompt_text,
+        )
+    except Exception as e:
+        gfd_result = None
+
+    # Generate the PPTX slides
     try:
         pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
-        buf = generate_gfd_slides(parsed["product_groups"], output_path=pptx_path)
+        if gfd_result:
+            buf = generate_gfd_slides(
+                gfd_result["interpreted_groups"],
+                executive_overview=gfd_result["executive_overview"],
+                output_path=pptx_path,
+            )
+        else:
+            buf = generate_gfd_slides(parsed["product_groups"], output_path=pptx_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate slides: {str(e)}")
 
