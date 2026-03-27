@@ -452,7 +452,7 @@ async def upload_gfd(file: UploadFile = File(...)):
     # Generate the PPTX slides
     try:
         pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
-        buf = generate_gfd_slides(parsed["product_groups"], output_path=pptx_path)
+        buf = generate_gfd_slides(parsed, output_path=pptx_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate slides: {str(e)}")
 
