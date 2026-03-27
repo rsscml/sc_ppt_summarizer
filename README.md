@@ -2,6 +2,8 @@
 
 An agentic web application that summarizes Global Supply Chain Status Report PowerPoint decks (50+ slides) into two board-ready outputs: a **2–4 slide executive summary** and a **structured email status update** — both grounded in your company's own glossary of abbreviations, locations, and domain terms.
 
+Additionally, the app generates a **Global Fulfilment Dashboard** presentation directly from the `Dashboard_Update` Excel worksheet, producing color-coded, CW-based risk heatmap slides for senior management review.
+
 ## Architecture
 
 ```
@@ -17,6 +19,8 @@ An agentic web application that summarizes Global Supply Chain Status Report Pow
 │  /api/glossary        → Glossary CRUD    │
 │  /api/tokens          → Token tracking   │
 │  /api/traces          → Execution traces │
+│  /api/gfd/upload      → GFD Excel parse  │
+│  /api/gfd/download    → GFD PPT download │
 │                                          │
 │  ┌────────────────────────────────────┐  │
 │  │        LangGraph Workflow          │  │
@@ -34,8 +38,22 @@ An agentic web application that summarizes Global Supply Chain Status Report Pow
 │  │      + glossary context)           │  │
 │  └────────────────────────────────────┘  │
 │                                          │
+│  ┌────────────────────────────────────┐  │
+│  │   GFD Dashboard Generator          │  │
+│  │                                    │  │
+│  │  1. Parse Dashboard_Update Excel   │  │
+│  │     (multi-row headers, merges,    │  │
+│  │      fuzzy column matching)        │  │
+│  │              ↓                     │  │
+│  │  2. Generate CW-based RAG slides  │  │
+│  │     (12-week grid + next quarter,  │  │
+│  │      auto-paginated)               │  │
+│  └────────────────────────────────────┘  │
+│                                          │
 │  PPT Parser (python-pptx)                │
 │  Glossary Loader (multi-format JSON)     │
+│  GFD Excel Parser (openpyxl)             │
+│  GFD Slide Generator (python-pptx)       │
 └──────────────────────────────────────────┘
 ```
 
@@ -91,9 +109,73 @@ Open http://localhost:8000
 
 ### 4. Use
 
-Upload your `.pptx` → review detected sections → generate outputs → switch between **Slide Summary** and **Email Summary** tabs → refine each independently via chat.
+**PPT Summarizer:** Upload your `.pptx` → review detected sections → generate outputs → switch between **Slide Summary** and **Email Summary** tabs → refine each independently via chat.
 
-## Dual Output
+**GFD Dashboard:** Upload your `.xlsx` containing the `Dashboard_Update` worksheet → download the generated `.pptx` with color-coded CW risk heatmap.
+
+---
+
+## Global Fulfilment Dashboard (GFD) Module
+
+### Overview
+
+The GFD module converts the `Dashboard_Update` Excel worksheet into presentation-ready slides showing a forward-looking calendar-week risk heatmap. Each row in the Excel represents a delivery risk for a product family at a specific plant, and the generated slides show whether supply coverage extends across the next 12 weeks plus the following quarter.
+
+### Slide Layout
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Global Fulfilment Dashboard                              CW13/2026    │
+├───────┬─────┬─────────┬──────┬───┬───┬───┬───┬···┬───┬────┬──────┬────┬───┤
+│ PG    │Plant│Customer │Cover.│13 │14 │15 │16 │   │24 │ Q2 │Suppl.│Act.│FM │
+│(merge)│     │         │      │■■■│■■■│■■■│■■■│   │■■■│■■■ │      │    │   │
+└───────┴─────┴─────────┴──────┴───┴───┴───┴───┴···┴───┴────┴──────┴────┴───┘
+
+■ GREEN = covered without mitigation
+■ AMBER = covered only if mitigations succeed
+■ RED   = beyond all coverage (uncovered)
+```
+
+### CW RAG Logic
+
+The RAG status for each calendar-week cell is derived from two coverage boundary fields in the Excel:
+
+- **Coverage w/o risk mitigation** (e.g., `CW15`) — supply is secured through this week without any special actions
+- **Coverage w/ risk mitigation** (e.g., `CW19`) — supply is secured through this week assuming mitigations succeed
+
+For each CW column on the slide:
+
+| Condition | Color | Meaning |
+|-----------|-------|---------|
+| CW ≤ coverage w/o mitigation | GREEN | Supply secured |
+| CW > w/o but ≤ w/ mitigation | AMBER | Depends on mitigation actions |
+| CW > coverage w/ mitigation | RED | No supply plan in place |
+
+The **next-quarter summary column** (e.g., Q2) shows the worst-case RAG across all weeks in that quarter. If any single week in Q2 is RED, the Q2 column shows RED.
+
+### Excel Parser Robustness
+
+The parser (`gfd_excel_parser.py`) is designed for real-world Excel files that are not perfectly structured:
+
+- **Multi-row headers** — Automatically detects and flattens stacked header rows (e.g., a category row above a column-name row) using keyword-scoring heuristics
+- **Headers not at row 1** — Scans the first 25 rows for the header band, skipping title rows, logos, and blank rows
+- **Merged cells** — Resolves both header merges (horizontal/vertical) and data merges (e.g., product group cells spanning multiple rows)
+- **Fuzzy column matching** — Three-pass matching: (1) exact normalised match, (2) keyword containment, (3) fuzzy similarity (SequenceMatcher > 0.75). Handles newlines in headers, underscores vs spaces, inconsistent casing
+- **Non-data row filtering** — Automatically skips separator rows (`---`, `===`), subtotal rows, and rows with insufficient data
+- **European number/date formats** — Handles `1.234,56` numbers, `DD.MM.YYYY` dates, `€` symbols
+- **CW format flexibility** — Parses `CW18`, `CW18/2026`, `CW18/26`, `KW18` (German), `W18`, and bare `18`
+
+### GFD API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/gfd/upload` | Upload `.xlsx`, parse `Dashboard_Update` sheet, generate slides |
+| GET | `/api/gfd/download` | Download generated `.pptx`. Query param: `session_id` |
+| GET | `/api/gfd/session/{id}` | Session metadata (row count, warnings, product groups) |
+
+---
+
+## Dual Output (PPT Summarizer)
 
 The app produces two independent outputs from the same underlying section summaries:
 
@@ -143,6 +225,8 @@ Each output can be downloaded as a formatted `.docx` Word document via a discret
 
 **Email Status Summary** — The same section summaries feed a separate LLM call with a dedicated prompt following the crisis-status email template. Only sections with substantive data are included.
 
+**GFD Dashboard Generation** — The `gfd_excel_parser.py` module parses the `Dashboard_Update` worksheet with multi-row header detection and fuzzy column matching. Parsed rows are grouped by product family, coverage CW boundaries are extracted, and `gfd_slide_generator.py` produces widescreen slides with a 12-week + next-quarter RAG heatmap. No LLM calls are needed — this is a deterministic data-to-slide pipeline.
+
 **Refinement** — Each output (slides or email) can be refined independently via chat. The refine endpoint accepts a `target` parameter (`slides` or `email`) and routes to the appropriate prompt, which has access to both the current output and the original section summaries.
 
 **Observability** — Every LLM call logs prompt/completion token counts. Every graph node execution is traced with timing, inputs, and outputs. Both are viewable in dedicated dashboards.
@@ -159,6 +243,8 @@ supply-chain-summarizer/
 ├── agent.py                      # LangGraph agent, prompts, tracing
 ├── glossary.py                   # Glossary loader & prompt renderer
 ├── docx_export.py                # Markdown → Word document converter
+├── gfd_excel_parser.py           # Dashboard_Update Excel parser
+├── gfd_slide_generator.py        # GFD → PowerPoint slide generator
 ├── requirements.txt
 ├── glossary/                     # Company glossary JSON files
 │   └── _sample_glossary.json     # Example with 58 entries
@@ -166,12 +252,12 @@ supply-chain-summarizer/
 │   ├── index.html                # Main UI (tabbed: slides / email / sections)
 │   ├── tracing.html              # Trace dashboard
 │   └── tokens.html               # Token usage dashboard
-└── uploads/                      # Uploaded PPT files (auto-created)
+└── uploads/                      # Uploaded PPT/XLSX files (auto-created)
 ```
 
 ## API Reference
 
-### Core
+### Core (PPT Summarizer)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -182,6 +268,14 @@ supply-chain-summarizer/
 | GET | `/api/download` | Download output as `.docx`. Query params: `session_id`, `target` (`slides` or `email`) |
 | GET | `/api/session/{id}` | Session metadata |
 | GET | `/api/sessions` | List all sessions |
+
+### GFD Dashboard
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/gfd/upload` | Upload `.xlsx` and generate dashboard `.pptx` |
+| GET | `/api/gfd/download` | Download generated `.pptx`. Query param: `session_id` |
+| GET | `/api/gfd/session/{id}` | Parsed data metadata and warnings |
 
 ### Glossary
 

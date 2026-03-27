@@ -20,6 +20,8 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from ppt_parser import parse_presentation
 from glossary import load_glossary_dir, load_glossary_file, normalise_json, render_glossary_for_prompt
 from docx_export import markdown_to_docx
+from gfd_excel_parser import parse_dashboard_update, summarise_for_prompt
+from gfd_slide_generator import generate_gfd_slides
 from agent import (
     build_summarization_graph,
     refine_summary,
@@ -82,6 +84,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # ─── In-memory session store ──────────────────────────────────────────
 
 sessions: dict[str, dict] = {}
+gfd_sessions: dict[str, dict] = {}
 
 
 def get_session(session_id: str) -> dict:
@@ -422,6 +425,108 @@ async def delete_glossary_file(filename: str):
 
     return {"deleted": filename, "total_entries": len(glossary_entries)}
 
+# ─── Routes: GFD Dashboard ──────────────────────────────────────────
+
+@app.post("/api/gfd/upload")
+async def upload_gfd(file: UploadFile = File(...)):
+    """Upload an Excel file, parse Dashboard_Update, generate GFD slides."""
+    if not file.filename.endswith((".xlsx", ".xls", ".xlsm")):
+        raise HTTPException(status_code=400, detail="Please upload an .xlsx file.")
+
+    session_id = str(uuid.uuid4())
+    file_path = UPLOAD_DIR / f"{session_id}_{file.filename}"
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    # Parse the Dashboard_Update worksheet
+    try:
+        parsed = parse_dashboard_update(str(file_path))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse Excel: {str(e)}")
+
+    # Generate the PPTX slides
+    try:
+        pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
+        buf = generate_gfd_slides(parsed, output_path=pptx_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate slides: {str(e)}")
+
+    # Store session
+    gfd_sessions[session_id] = {
+        "session_id": session_id,
+        "filename": file.filename,
+        "file_path": str(file_path),
+        "pptx_path": pptx_path,
+        "parsed": parsed,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Build response summary
+    pg_overview = []
+    for pg in parsed["product_groups"]:
+        pg_overview.append({
+            "product_family": pg["product_family_desc"],
+            "code": pg["product_family_code"],
+            "risk_items": len(pg["rows"]),
+        })
+
+    return {
+        "session_id": session_id,
+        "filename": file.filename,
+        "total_rows": parsed["metadata"]["total_rows"],
+        "product_groups": pg_overview,
+        "warnings": parsed["warnings"],
+        "header_rows": parsed["metadata"]["header_rows"],
+        "mapped_columns": parsed["metadata"]["mapped_columns"],
+    }
+
+
+@app.get("/api/gfd/download")
+async def download_gfd_pptx(session_id: str = Query(...)):
+    """Download the generated GFD dashboard as a .pptx file."""
+    if session_id not in gfd_sessions:
+        raise HTTPException(status_code=404, detail="GFD session not found.")
+
+    sess = gfd_sessions[session_id]
+    pptx_path = Path(sess["pptx_path"])
+
+    if not pptx_path.exists():
+        raise HTTPException(status_code=500, detail="Generated PPTX file not found.")
+
+    source_name = sess.get("filename", "dashboard")
+    download_name = f"GFD_Dashboard_{source_name.replace('.xlsx', '')}.pptx"
+
+    return StreamingResponse(
+        open(pptx_path, "rb"),
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
+@app.get("/api/gfd/session/{session_id}")
+async def get_gfd_session(session_id: str):
+    """Return metadata for a GFD session."""
+    if session_id not in gfd_sessions:
+        raise HTTPException(status_code=404, detail="GFD session not found.")
+
+    sess = gfd_sessions[session_id]
+    parsed = sess["parsed"]
+
+    return {
+        "session_id": session_id,
+        "filename": sess["filename"],
+        "created_at": sess["created_at"],
+        "metadata": parsed["metadata"],
+        "warnings": parsed["warnings"],
+        "product_groups": [
+            {
+                "product_family": pg["product_family_desc"],
+                "code": pg["product_family_code"],
+                "risk_items": len(pg["rows"]),
+            }
+            for pg in parsed["product_groups"]
+        ],
+    }
 
 if __name__ == "__main__":
     import uvicorn
