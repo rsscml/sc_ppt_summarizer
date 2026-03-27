@@ -159,6 +159,19 @@
         <div class="filename" id="fileName" style="display:none"></div>
         <input type="file" id="fileInput" accept=".xlsx,.xls,.xlsm" style="display:none" onchange="handleFile(this)">
       </div>
+      <div style="margin-top:14px; display:flex; align-items:center; gap:10px;">
+        <label for="historyWeeks" style="font-size:12px; font-weight:500; color:var(--text-dim); white-space:nowrap;">History window</label>
+        <select id="historyWeeks" style="flex:1; padding:6px 10px; border-radius:6px; border:1px solid var(--border); font-size:12px; font-family:var(--sans); color:var(--text); background:var(--white); cursor:pointer;">
+          <option value="1">Last 1 week</option>
+          <option value="2" selected>Last 2 weeks</option>
+          <option value="4">Last 4 weeks</option>
+          <option value="8">Last 8 weeks</option>
+          <option value="13">Last quarter</option>
+          <option value="26">Last 6 months</option>
+          <option value="52">Last year</option>
+          <option value="0">All data (no filter)</option>
+        </select>
+      </div>
       <div style="margin-top:12px">
         <button class="btn btn-primary btn-full" id="btnUpload" onclick="uploadAndGenerate()" disabled>
           Upload &amp; Generate Dashboard
@@ -292,6 +305,7 @@
 
     const fd = new FormData();
     fd.append('file', selectedFile);
+    fd.append('history_weeks', document.getElementById('historyWeeks').value);
 
     let pct = 10;
     const iv = setInterval(() => {

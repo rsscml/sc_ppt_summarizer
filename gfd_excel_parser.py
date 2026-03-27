@@ -21,7 +21,7 @@ Design principles:
 
 import re
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Optional
 from difflib import SequenceMatcher
 
@@ -780,6 +780,61 @@ def _group_by_product(rows: list[dict]) -> list[dict]:
             order.append(key)
         groups[key]["rows"].append(row)
     return [groups[k] for k in order]
+
+
+# ─── Recency Filter ──────────────────────────────────────────────────
+
+def filter_by_recency(parsed: dict, history_weeks: int = 2) -> dict:
+    """
+    Filter parsed dashboard data to only include rows updated within the
+    last `history_weeks` weeks. Rows without a parseable `last_update` date
+    are kept (benefit of the doubt).
+
+    Returns a new parsed dict with filtered rows and re-grouped product_groups.
+    The original dict is not mutated.
+    """
+    if history_weeks <= 0:
+        return parsed  # no filtering
+
+    cutoff = date.today() - timedelta(weeks=history_weeks)
+    kept_rows: list[dict] = []
+    dropped = 0
+
+    for row in parsed.get("rows", []):
+        last_update = row.get("last_update")
+        if last_update is None:
+            kept_rows.append(row)  # no date → keep
+            continue
+        try:
+            row_date = date.fromisoformat(str(last_update)[:10])
+            if row_date >= cutoff:
+                kept_rows.append(row)
+            else:
+                dropped += 1
+        except (ValueError, TypeError):
+            kept_rows.append(row)  # unparseable → keep
+
+    product_groups = _group_by_product(kept_rows)
+
+    warnings = list(parsed.get("warnings", []))
+    if dropped:
+        warnings.append(
+            f"Recency filter (last {history_weeks} weeks): kept {len(kept_rows)} rows, "
+            f"excluded {dropped} older rows (cutoff: {cutoff.isoformat()})"
+        )
+
+    metadata = dict(parsed.get("metadata", {}))
+    metadata["total_rows"] = len(kept_rows)
+    metadata["recency_filter_weeks"] = history_weeks
+    metadata["rows_excluded_by_recency"] = dropped
+
+    return {
+        **parsed,
+        "rows": kept_rows,
+        "product_groups": product_groups,
+        "warnings": warnings,
+        "metadata": metadata,
+    }
 
 
 # ─── Convenience: Quick Summary for LLM ──────────────────────────────
