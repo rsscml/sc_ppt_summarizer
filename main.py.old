@@ -110,11 +110,6 @@ async def tokens_page():
     return (STATIC_DIR / "tokens.html").read_text()
 
 
-@app.get("/gfd", response_class=HTMLResponse)
-async def gfd_page():
-    return (STATIC_DIR / "gfd.html").read_text()
-
-
 # ─── Routes: API ──────────────────────────────────────────────────────
 
 @app.get("/api/health")
