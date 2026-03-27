@@ -80,6 +80,7 @@
   <div class="topbar-brand"><div class="mark">SC</div><span>Supply Chain Summarizer</span></div>
   <div class="topbar-nav">
     <a href="/">Summarizer</a>
+    <a href="/gfd">GFD Dashboard</a>
     <a href="/tracing" class="active">Traces</a>
     <a href="/tokens">Token Usage</a>
   </div>
@@ -104,6 +105,8 @@
       <option value="summarize_section">Summarize Section</option>
       <option value="generate_executive_summary">Executive Summary</option>
       <option value="refine_summary">Refine</option>
+      <option value="gfd_interpret_pg">GFD: Interpret PG</option>
+      <option value="gfd_executive_overview">GFD: Overview</option>
     </select>
   </div>
 
@@ -145,6 +148,8 @@
     if (n.includes('summarize_section')) return 'summarize';
     if (n.includes('executive')) return 'executive';
     if (n.includes('refine')) return 'refine';
+    if (n.includes('gfd_interpret')) return 'summarize';
+    if (n.includes('gfd_executive')) return 'executive';
     return 'summarize';
   }
 

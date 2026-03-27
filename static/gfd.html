@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GFD Dashboard — SC Summarizer</title>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,300;0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&family=Instrument+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --white: #ffffff; --bg: #fafafa; --surface: #ffffff; --surface-2: #f5f5f4; --surface-3: #eeeded;
+    --border: #e5e4e2; --border-focus: #b0ada8;
+    --text: #1a1a1a; --text-2: #3d3d3d; --text-dim: #6b6b6b; --text-muted: #9a9a9a;
+    --accent: #2c5282; --accent-light: #edf2f7; --accent-mid: #bee3f8;
+    --green: #276749; --green-bg: #f0fff4;
+    --amber: #975a16; --amber-bg: #fefcbf;
+    --red: #c53030; --red-bg: #fff5f5;
+    --serif: 'Source Serif 4', Georgia, serif;
+    --sans: 'Instrument Sans', -apple-system, system-ui, sans-serif;
+    --mono: 'IBM Plex Mono', 'Menlo', monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { font-size: 15px; }
+  body { font-family: var(--sans); background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.6; -webkit-font-smoothing: antialiased; }
+
+  /* ── Top Bar ─────────────────────── */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 32px; height: 52px; background: var(--white);
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 100;
+  }
+  .topbar-brand { display: flex; align-items: center; gap: 10px; font-family: var(--serif); font-weight: 600; font-size: 16px; letter-spacing: -0.03em; color: var(--text); }
+  .topbar-brand .mark { width: 28px; height: 28px; border-radius: 6px; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-family: var(--sans); font-weight: 700; font-size: 13px; }
+  .topbar-nav { display: flex; gap: 2px; }
+  .topbar-nav a { padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; color: var(--text-dim); text-decoration: none; transition: all 0.15s; }
+  .topbar-nav a:hover { background: var(--surface-2); color: var(--text); }
+  .topbar-nav a.active { background: var(--accent-light); color: var(--accent); }
+
+  /* ── Layout ─────────────────────── */
+  .app-layout { display: grid; grid-template-columns: 340px 1fr; height: calc(100vh - 52px); }
+  @media (max-width: 860px) { .app-layout { grid-template-columns: 1fr; } .sidebar { border-right: none; border-bottom: 1px solid var(--border); max-height: 45vh; } }
+
+  /* ── Sidebar ─────────────────────── */
+  .sidebar { background: var(--white); border-right: 1px solid var(--border); overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 24px; }
+  .sidebar-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-muted); margin-bottom: 12px; }
+
+  /* ── Upload Zone ─────────────────── */
+  .upload-zone {
+    border: 1.5px dashed var(--border); border-radius: 12px; padding: 32px 20px;
+    text-align: center; cursor: pointer; transition: all 0.2s ease; background: var(--white);
+  }
+  .upload-zone:hover, .upload-zone.dragover { border-color: var(--accent); background: var(--accent-light); }
+  .upload-icon { width: 44px; height: 44px; margin: 0 auto 12px; background: var(--surface-2); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+  .upload-zone h4 { font-size: 14px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+  .upload-zone p { font-size: 12px; color: var(--text-muted); }
+  .upload-zone .filename { font-family: var(--mono); font-size: 12px; color: var(--green); margin-top: 10px; word-break: break-all; background: var(--green-bg); padding: 6px 10px; border-radius: 6px; }
+
+  /* ── Buttons ─────────────────────── */
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 10px 18px; border-radius: 8px; font-size: 13px; font-weight: 600; border: none; cursor: pointer; transition: all 0.15s; font-family: var(--sans); }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #1e4a7a; }
+  .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+  .btn-full { width: 100%; }
+  .btn-download { background: var(--green); color: #fff; }
+  .btn-download:hover { background: #1e5639; }
+
+  /* ── Product group pills ──────────── */
+  .pg-list { display: flex; flex-direction: column; gap: 6px; }
+  .pg-pill { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 10px 12px; border-radius: 8px; background: var(--surface-2); }
+  .pg-pill .pg-info { flex: 1; }
+  .pg-pill .pg-name { font-size: 13px; font-weight: 600; color: var(--text-2); line-height: 1.3; }
+  .pg-pill .pg-headline { font-size: 11px; color: var(--text-dim); margin-top: 2px; line-height: 1.4; }
+  .pg-pill .pg-count { font-family: var(--mono); font-size: 11px; color: var(--text-muted); background: var(--white); padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); white-space: nowrap; flex-shrink: 0; }
+  .pg-pill .risk-badge { font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 4px; color: #fff; text-transform: uppercase; letter-spacing: 0.04em; flex-shrink: 0; }
+  .risk-CRITICAL { background: #c53030; }
+  .risk-HIGH { background: #dd6b20; }
+  .risk-MEDIUM { background: #d69e2e; }
+  .risk-LOW { background: #38a169; }
+
+  /* ── Session & warning cards ──────── */
+  .session-card { background: var(--surface-2); border-radius: 8px; padding: 12px; font-size: 12px; color: var(--text-dim); font-family: var(--mono); line-height: 1.8; }
+  .warning-card { background: var(--amber-bg); border: 1px solid #fbd38d; border-radius: 8px; padding: 10px 12px; font-size: 12px; color: var(--amber); margin-top: 8px; }
+  .warning-card .warn-label { font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+  .warning-card .warn-item { padding-left: 10px; line-height: 1.6; }
+
+  /* ── Main Panel ──────────────────── */
+  .main-panel { display: flex; flex-direction: column; height: 100%; overflow: hidden; background: var(--bg); }
+  .main-header { padding: 14px 32px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; background: var(--white); }
+  .main-header h2 { font-family: var(--serif); font-size: 17px; font-weight: 600; letter-spacing: -0.02em; }
+  .status-pill { font-size: 11px; font-weight: 600; padding: 4px 12px; border-radius: 20px; letter-spacing: 0.02em; }
+  .status-pill.idle { background: var(--surface-2); color: var(--text-muted); }
+  .status-pill.processing { background: var(--accent-light); color: var(--accent); }
+  .status-pill.ready { background: var(--green-bg); color: var(--green); }
+
+  /* ── Progress ────────────────────── */
+  .progress-bar { padding: 16px 32px; display: none; background: var(--white); border-bottom: 1px solid var(--border); }
+  .progress-bar.visible { display: block; }
+  .progress-track { height: 3px; background: var(--surface-3); border-radius: 2px; overflow: hidden; }
+  .progress-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.4s ease; }
+  .progress-label { font-size: 12px; color: var(--text-dim); margin-top: 8px; font-family: var(--mono); }
+
+  /* ── Content ─────────────────────── */
+  .content-area { flex: 1; overflow-y: auto; padding: 32px; }
+  .welcome { display: flex; align-items: center; justify-content: center; height: 100%; text-align: center; }
+  .welcome-inner { max-width: 500px; }
+  .welcome-inner h2 { font-family: var(--serif); font-size: 26px; font-weight: 600; letter-spacing: -0.03em; line-height: 1.3; margin-bottom: 12px; }
+  .welcome-inner p { font-size: 14px; color: var(--text-dim); line-height: 1.7; }
+  .steps { margin-top: 28px; text-align: left; }
+  .step { display: flex; gap: 14px; padding: 14px 0; border-top: 1px solid var(--border); }
+  .step:last-child { padding-bottom: 0; }
+  .step-num { width: 28px; height: 28px; border-radius: 50%; background: var(--accent-light); color: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0; font-family: var(--mono); }
+  .step-text { font-size: 13.5px; color: var(--text-dim); padding-top: 4px; line-height: 1.5; }
+
+  /* ── Overview card ────────────────── */
+  .overview-card { background: var(--white); border: 1px solid var(--border); border-radius: 12px; padding: 28px 32px; margin-bottom: 24px; }
+  .overview-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  .overview-title { font-family: var(--serif); font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: var(--text); }
+  .overall-badge { font-size: 12px; font-weight: 700; padding: 6px 16px; border-radius: 8px; color: #fff; letter-spacing: 0.03em; }
+  .overview-bullets { list-style: none; }
+  .overview-bullets li { padding: 8px 0; border-top: 1px solid var(--surface-3); font-size: 14px; color: var(--text-2); line-height: 1.6; display: flex; align-items: flex-start; gap: 10px; }
+  .overview-bullets li:first-child { border-top: none; }
+  .bullet-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; margin-top: 7px; }
+
+  /* ── Download section ─────────────── */
+  .download-section { background: var(--white); border: 1px solid var(--border); border-radius: 12px; padding: 24px 32px; display: flex; align-items: center; justify-content: space-between; }
+  .dl-info { }
+  .dl-info h3 { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+  .dl-info p { font-size: 13px; color: var(--text-dim); }
+
+  /* ── Toast ───────────────────────── */
+  .toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 22px; border-radius: 10px; font-size: 13px; font-weight: 500; background: var(--white); border: 1px solid var(--border); color: var(--text); z-index: 1000; box-shadow: 0 4px 24px rgba(0,0,0,0.08); transform: translateY(80px); opacity: 0; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.error { border-color: var(--red); color: var(--red); }
+  .toast.success { border-color: var(--green); color: var(--green); }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-brand"><div class="mark">SC</div><span>Supply Chain Summarizer</span></div>
+  <div class="topbar-nav">
+    <a href="/">Summarizer</a>
+    <a href="/gfd" class="active">GFD Dashboard</a>
+    <a href="/tracing">Traces</a>
+    <a href="/tokens">Token Usage</a>
+  </div>
+</div>
+
+<div class="app-layout">
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Upload Dashboard Excel</div>
+      <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+        <div class="upload-icon">&#x1F4CA;</div>
+        <h4>Drop .xlsx file here</h4>
+        <p>with Dashboard_Update sheet</p>
+        <div class="filename" id="fileName" style="display:none"></div>
+        <input type="file" id="fileInput" accept=".xlsx,.xls,.xlsm" style="display:none" onchange="handleFile(this)">
+      </div>
+      <div style="margin-top:12px">
+        <button class="btn btn-primary btn-full" id="btnUpload" onclick="uploadAndGenerate()" disabled>
+          Upload &amp; Generate Dashboard
+        </button>
+      </div>
+    </div>
+
+    <div class="sidebar-section" id="pgPanel" style="display:none">
+      <div class="sidebar-label">Product Groups</div>
+      <div class="pg-list" id="pgList"></div>
+    </div>
+
+    <div class="sidebar-section" id="warningsPanel" style="display:none">
+      <div class="warning-card">
+        <div class="warn-label">Parser Warnings</div>
+        <div id="warningsList"></div>
+      </div>
+    </div>
+
+    <div class="sidebar-section" id="sessionPanel" style="display:none">
+      <div class="sidebar-label">Session</div>
+      <div class="session-card" id="sessionDetails"></div>
+    </div>
+
+  </div>
+
+  <!-- Main -->
+  <div class="main-panel">
+    <div class="main-header">
+      <h2>Global Fulfilment Dashboard</h2>
+      <span class="status-pill idle" id="statusPill">Waiting</span>
+    </div>
+
+    <div class="progress-bar" id="progressBar">
+      <div class="progress-track"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+      <div class="progress-label" id="progressLabel">Initializing...</div>
+    </div>
+
+    <div class="content-area" id="contentArea">
+      <div class="welcome" id="welcomeScreen">
+        <div class="welcome-inner">
+          <h2>Global Fulfilment<br>Dashboard Generator</h2>
+          <p>Upload your Dashboard_Update Excel file and get a presentation-ready CW-based risk heatmap — with LLM-interpreted action summaries and an executive overview slide.</p>
+          <div class="steps">
+            <div class="step">
+              <div class="step-num">1</div>
+              <div class="step-text">Upload your .xlsx file containing the Dashboard_Update worksheet</div>
+            </div>
+            <div class="step">
+              <div class="step-num">2</div>
+              <div class="step-text">The LLM interprets and condenses each product group's risk data</div>
+            </div>
+            <div class="step">
+              <div class="step-num">3</div>
+              <div class="step-text">Download the generated .pptx with overview slide + CW heatmap tables</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="resultArea" style="display:none">
+        <div class="overview-card" id="overviewCard"></div>
+        <div class="download-section" id="downloadSection"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  let gfdSessionId = null;
+  let selectedFile = null;
+
+  function toast(msg, type = '') {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast ' + type + ' show';
+    setTimeout(() => t.classList.remove('show'), 4000);
+  }
+
+  function setStatus(text, cls) {
+    const b = document.getElementById('statusPill');
+    b.textContent = text;
+    b.className = 'status-pill ' + cls;
+  }
+
+  function showProgress(pct, label) {
+    document.getElementById('progressBar').classList.add('visible');
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('progressLabel').textContent = label;
+  }
+
+  function hideProgress() { document.getElementById('progressBar').classList.remove('visible'); }
+
+  // ── File handling ──
+  function handleFile(input) {
+    if (input.files.length) {
+      selectedFile = input.files[0];
+      document.getElementById('fileName').textContent = selectedFile.name;
+      document.getElementById('fileName').style.display = 'block';
+      document.getElementById('btnUpload').disabled = false;
+    }
+  }
+
+  const uz = document.getElementById('uploadZone');
+  uz.addEventListener('dragover', e => { e.preventDefault(); uz.classList.add('dragover'); });
+  uz.addEventListener('dragleave', () => uz.classList.remove('dragover'));
+  uz.addEventListener('drop', e => {
+    e.preventDefault(); uz.classList.remove('dragover');
+    if (e.dataTransfer.files.length) {
+      selectedFile = e.dataTransfer.files[0];
+      document.getElementById('fileName').textContent = selectedFile.name;
+      document.getElementById('fileName').style.display = 'block';
+      document.getElementById('btnUpload').disabled = false;
+    }
+  });
+
+  // ── Upload & Generate ──
+  async function uploadAndGenerate() {
+    if (!selectedFile) return;
+    const btn = document.getElementById('btnUpload');
+    btn.disabled = true;
+    btn.textContent = 'Processing...';
+    setStatus('Processing', 'processing');
+    showProgress(10, 'Uploading Excel file...');
+
+    document.getElementById('welcomeScreen').style.display = 'none';
+    document.getElementById('resultArea').style.display = 'none';
+
+    const fd = new FormData();
+    fd.append('file', selectedFile);
+
+    let pct = 10;
+    const iv = setInterval(() => {
+      if (pct < 85) {
+        pct += 3;
+        const labels = [
+          'Parsing Dashboard_Update worksheet...',
+          'Detecting headers and columns...',
+          'Interpreting product groups with LLM...',
+          'Condensing actions and root causes...',
+          'Generating executive overview...',
+          'Building CW heatmap slides...',
+        ];
+        const idx = Math.min(Math.floor((pct - 10) / 13), labels.length - 1);
+        showProgress(pct, labels[idx]);
+      }
+    }, 1800);
+
+    try {
+      const res = await fetch('/api/gfd/upload', { method: 'POST', body: fd });
+      clearInterval(iv);
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Processing failed');
+      }
+      const data = await res.json();
+      gfdSessionId = data.session_id;
+
+      showProgress(100, 'Done');
+      setStatus('Ready', 'ready');
+
+      // ── Sidebar: Product Groups ──
+      const pgList = document.getElementById('pgList');
+      pgList.innerHTML = '';
+      (data.product_groups || []).forEach(pg => {
+        const riskClass = pg.headline && pg.headline.match(/CRITICAL|HIGH|MEDIUM|LOW/)
+          ? pg.headline.match(/CRITICAL|HIGH|MEDIUM|LOW/)[0] : '';
+        pgList.innerHTML += `<div class="pg-pill">
+          <div class="pg-info">
+            <div class="pg-name">${pg.product_family}${pg.code ? ' (' + pg.code + ')' : ''}</div>
+            ${pg.headline ? '<div class="pg-headline">' + pg.headline + '</div>' : ''}
+          </div>
+          <span class="pg-count">${pg.risk_items} risk${pg.risk_items !== 1 ? 's' : ''}</span>
+        </div>`;
+      });
+      document.getElementById('pgPanel').style.display = 'block';
+
+      // ── Sidebar: Warnings ──
+      if (data.warnings && data.warnings.length) {
+        const wl = document.getElementById('warningsList');
+        wl.innerHTML = data.warnings.map(w => `<div class="warn-item">&#x26A0; ${w}</div>`).join('');
+        document.getElementById('warningsPanel').style.display = 'block';
+      } else {
+        document.getElementById('warningsPanel').style.display = 'none';
+      }
+
+      // ── Sidebar: Session ──
+      document.getElementById('sessionPanel').style.display = 'block';
+      document.getElementById('sessionDetails').innerHTML =
+        `${data.filename}<br>${data.total_rows} risk items · ${(data.product_groups || []).length} product groups`;
+
+      // ── Main: Overview Card ──
+      const overview = data.executive_overview || {};
+      const overviewCard = document.getElementById('overviewCard');
+      const risk = overview.overall_risk || 'HIGH';
+      const badgeClass = 'risk-' + risk;
+      let bulletsHtml = '';
+      (overview.bullets || []).forEach(b => {
+        bulletsHtml += `<li><span class="bullet-dot"></span>${b}</li>`;
+      });
+      overviewCard.innerHTML = `
+        <div class="overview-header">
+          <div class="overview-title">${overview.title || 'Fulfilment Risk Overview'}</div>
+          <span class="overall-badge ${badgeClass}">${risk}</span>
+        </div>
+        <ul class="overview-bullets">${bulletsHtml}</ul>
+      `;
+
+      // ── Main: Download ──
+      const dlSection = document.getElementById('downloadSection');
+      dlSection.innerHTML = `
+        <div class="dl-info">
+          <h3>Dashboard slides ready</h3>
+          <p>Executive overview + CW${getCurrentWeek()} forward-looking heatmap (${data.total_rows} risk items)</p>
+        </div>
+        <button class="btn btn-download" onclick="downloadPptx()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Download .pptx
+        </button>
+      `;
+
+      document.getElementById('resultArea').style.display = 'block';
+      toast(`Dashboard generated: ${data.total_rows} risk items across ${(data.product_groups || []).length} product groups`, 'success');
+      setTimeout(hideProgress, 1500);
+
+    } catch (e) {
+      clearInterval(iv);
+      toast(e.message, 'error');
+      setStatus('Error', 'idle');
+      hideProgress();
+      document.getElementById('welcomeScreen').style.display = 'flex';
+    }
+    btn.disabled = false;
+    btn.textContent = 'Upload & Generate Dashboard';
+  }
+
+  // ── Download ──
+  function downloadPptx() {
+    if (!gfdSessionId) return;
+    const a = document.createElement('a');
+    a.href = `/api/gfd/download?session_id=${encodeURIComponent(gfdSessionId)}`;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function getCurrentWeek() {
+    const now = new Date();
+    const start = new Date(now.getFullYear(), 0, 1);
+    const diff = now - start;
+    const oneWeek = 604800000;
+    return Math.ceil((diff / oneWeek) + start.getDay() / 7);
+  }
+</script>
+</body>
+</html>

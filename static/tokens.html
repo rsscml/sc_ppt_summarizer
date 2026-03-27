@@ -90,6 +90,7 @@
   <div class="topbar-brand"><div class="mark">SC</div><span>Supply Chain Summarizer</span></div>
   <div class="topbar-nav">
     <a href="/">Summarizer</a>
+    <a href="/gfd">GFD Dashboard</a>
     <a href="/tracing">Traces</a>
     <a href="/tokens" class="active">Token Usage</a>
   </div>
@@ -152,7 +153,7 @@
         chart.innerHTML = e.map(x => {
           const pP = (x.prompt_tokens / mx) * 130;
           const pC = (x.completion_tokens / mx) * 130;
-          const lb = x.step.replace('section_summary_','S').replace('executive_summary','Exec').replace('refine_summary','Refine');
+          const lb = x.step.replace('section_summary_','S').replace('executive_summary','Exec').replace('refine_summary','Refine').replace('gfd_interpret_pg_','GFD:').replace('gfd_executive_overview','GFD:Ovw').replace('refine_email','RefEmail');
           return `<div class="bar-col"><div class="bar-value">${(x.total_tokens/1000).toFixed(1)}k</div><div class="bar-stack"><div class="bar-prompt" style="height:${pP}px"></div><div class="bar-completion" style="height:${pC}px"></div></div><div class="bar-label" title="${x.step}">${lb}</div></div>`;
         }).join('');
       }
