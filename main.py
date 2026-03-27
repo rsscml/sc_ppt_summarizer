@@ -20,8 +20,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from ppt_parser import parse_presentation
 from glossary import load_glossary_dir, load_glossary_file, normalise_json, render_glossary_for_prompt
 from docx_export import markdown_to_docx
+
 from gfd_excel_parser import parse_dashboard_update, summarise_for_prompt
 from gfd_slide_generator import generate_gfd_slides
+from gfd_agent import run_gfd_pipeline
+
 from agent import (
     build_summarization_graph,
     refine_summary,
@@ -450,9 +453,34 @@ async def upload_gfd(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Failed to parse Excel: {str(e)}")
 
     # Generate the PPTX slides
+    #try:
+    #    pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
+    #    buf = generate_gfd_slides(parsed["product_groups"], output_path=pptx_path)
+    #except Exception as e:
+    #    raise HTTPException(status_code=500, detail=f"Failed to generate slides: {str(e)}")
+    
+    # Run LLM interpretation pipeline
+    try:
+        gfd_result = await run_gfd_pipeline(
+            session_id=session_id,
+            llm_config=LLM_CONFIG,
+            parsed_data=parsed,
+            glossary_context=glossary_prompt_text,
+        )
+    except Exception as e:
+        gfd_result = None
+
+    # Generate the PPTX slides
     try:
         pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
-        buf = generate_gfd_slides(parsed["product_groups"], output_path=pptx_path)
+        if gfd_result:
+            buf = generate_gfd_slides(
+                gfd_result["interpreted_groups"],
+                executive_overview=gfd_result["executive_overview"],
+                output_path=pptx_path,
+            )
+        else:
+            buf = generate_gfd_slides(parsed["product_groups"], output_path=pptx_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate slides: {str(e)}")
 
