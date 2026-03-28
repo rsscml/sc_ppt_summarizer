@@ -378,18 +378,6 @@ def _filter_by_recent_months(
     # Pass 1: let pandas auto-detect
     dates = pd.to_datetime(df[date_col], errors="coerce")
 
-    # Pass 2: for remaining NaTs, try European dot-separated formats
-    still_nat = dates.isna() & df[date_col].notna()
-    if still_nat.any():
-        for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y"):
-            if not still_nat.any():
-                break
-            parsed = pd.to_datetime(
-                df.loc[still_nat, date_col], format=fmt, errors="coerce"
-            )
-            dates[still_nat] = dates[still_nat].fillna(parsed)
-            still_nat = dates.isna() & df[date_col].notna()
-
     # ── Compute the month window ─────────────────────────────────────
     today = pd.Timestamp.today().normalize()
     start_current_month = today.replace(day=1)
@@ -403,8 +391,7 @@ def _filter_by_recent_months(
     # ── Apply filter ─────────────────────────────────────────────────
     # Keep rows where date is within window OR date is NaT (unparseable)
     in_window = (dates >= start_previous_month) & (dates < end_current_month)
-    is_nat = dates.isna()
-    keep_mask = in_window | is_nat
+    keep_mask = in_window
 
     filtered = df[keep_mask]
     num_removed = int((~keep_mask).sum())
