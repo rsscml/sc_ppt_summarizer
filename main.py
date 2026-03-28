@@ -490,6 +490,8 @@ async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(4))
         "current_cw": extracted.get("current_cw", ""),
         "total_rows_in_file": meta.get("total_rows_in_file", 0),
         "rows_after_filter": meta.get("rows_after_filter", 0),
+        "rows_extracted_by_llm": meta.get("rows_extracted_by_llm", 0),
+        "extraction_attempts": meta.get("extraction_attempts", 1),
         "product_groups": extracted.get("product_groups", []),
         "extraction_notes": extracted.get("extraction_notes", ""),
         "warnings": extracted.get("warnings", []),
@@ -640,6 +642,9 @@ async def get_gfd_session(session_id: str):
         "metadata": {
             "total_rows_in_file": meta.get("total_rows_in_file", 0),
             "rows_after_filter": meta.get("rows_after_filter", 0),
+            "rows_extracted_by_llm": meta.get("rows_extracted_by_llm", 0),
+            "extraction_attempts": meta.get("extraction_attempts", 1),
+            "completion_tokens_used": meta.get("completion_tokens_used", 0),
             "sheet_used": meta.get("sheet_used", ""),
             "headers_detected": len(meta.get("headers", [])),
         },

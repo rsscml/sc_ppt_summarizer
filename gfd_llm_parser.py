@@ -417,24 +417,40 @@ def _cell_str(value: Any) -> str:
 
 
 def _build_text_table(headers: list[str], rows: list[list[str]]) -> str:
-    """Render headers + rows as a compact pipe-delimited markdown table."""
-    MAX_COL_W = 500
-    col_widths = [min(max(len(h), 4), MAX_COL_W) for h in headers]
+    """Render headers + rows as a compact pipe-delimited markdown table.
+
+    Each data row is prefixed with a sequential row number (R001, R002, …)
+    so the LLM can individually track and account for every row, preventing
+    it from silently merging or skipping similar-looking rows.
+
+    Padding width is capped at 80 characters so a single long outlier cell
+    (e.g. a verbose action/comment) doesn't inflate the whitespace of every
+    other row in that column.  Cell *content* is never truncated — only the
+    ljust padding is capped, so free-text columns are preserved in full.
+    """
+    MAX_PAD_W = 80
+    ROW_NUM_W = 4                          # "R001"
+
+    col_widths = [min(max(len(h), 4), MAX_PAD_W) for h in headers]
     for row in rows:
         for i, cell in enumerate(row[: len(headers)]):
             if i < len(col_widths):
-                col_widths[i] = min(max(col_widths[i], len(cell)), MAX_COL_W)
+                col_widths[i] = min(max(col_widths[i], len(cell)), MAX_PAD_W)
 
-    def fmt(cells: list[str]) -> str:
+    def fmt(cells: list[str], row_label: str = "") -> str:
         padded = []
+        if row_label is not None:
+            padded.append(row_label.ljust(ROW_NUM_W))
         for i, h in enumerate(headers):
-            val = (cells[i] if i < len(cells) else "")[: MAX_COL_W]
+            val = cells[i] if i < len(cells) else ""
             padded.append(val.ljust(col_widths[i]))
         return "| " + " | ".join(padded) + " |"
 
-    sep = "|-" + "-|-".join("-" * w for w in col_widths) + "-|"
-    lines = [fmt(headers), sep] + [fmt(row) for row in rows]
-    return "\n".join(lines)
+    hdr_line = fmt(headers, row_label="#")
+    sep_widths = [ROW_NUM_W] + col_widths
+    sep = "|-" + "-|-".join("-" * w for w in sep_widths) + "-|"
+    data_lines = [fmt(row, row_label=f"R{i+1:03d}") for i, row in enumerate(rows)]
+    return "\n".join([hdr_line, sep] + data_lines)
 
 
 # ─── Main Stage 1 entry point ───────────────────────────────────────
@@ -469,9 +485,13 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
     """
     year, week = _get_current_cw()
     current_cw = f"CW{week}/{year}"
+    print(f"\n[GFD DEBUG] ═══ Stage 1: Excel → text table ═══")
+    print(f"[GFD DEBUG] File: {filepath}")
+    print(f"[GFD DEBUG] Current CW: {current_cw}")
 
     # ── Detect sheet name ────────────────────────────────────────────
     sheet_used, warnings = _detect_dashboard_sheet(filepath)
+    print(f"[GFD DEBUG] Sheet detected: '{sheet_used}'")
 
     # ── Extract clean DataFrame using pandas-based extractor ─────────
     try:
@@ -483,6 +503,8 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
 
     original_headers = list(df.columns)
     total_rows = len(df)
+    print(f"[GFD DEBUG] Extracted: {total_rows} rows × {len(original_headers)} cols "
+          f"(header at row {header_idx})")
 
     if total_rows == 0:
         warnings.append("No data rows found below the detected header row.")
@@ -511,11 +533,17 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
             f"Compacted {n_compacted} individual customer columns into "
             f"'Customers affected'."
         )
+        print(f"[GFD DEBUG] Customer compaction: {n_compacted} cols → 1 "
+              f"(now {len(df.columns)} cols)")
+    else:
+        print(f"[GFD DEBUG] Customer compaction: not triggered")
 
     # ── Filter rows by recency (current month + previous month) ────────
     date_col_name = _find_date_column(list(df.columns))
+    print(f"[GFD DEBUG] Date column: {date_col_name or '(none found)'}")
 
     if date_col_name:
+        pre_filter = len(df)
         df, skipped, window_desc = _filter_by_recent_months(df, date_col_name)
         warnings.append(
             f"Recency filter: keeping rows from {window_desc} "
@@ -526,6 +554,8 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
                 f"Recency filter: removed {skipped} row(s) outside the "
                 f"{window_desc} window."
             )
+        print(f"[GFD DEBUG] Recency filter: {pre_filter} → {len(df)} rows "
+              f"(removed {skipped}, window: {window_desc})")
     else:
         warnings.append(
             "Recency filter: no 'Last update' column found — "
@@ -558,6 +588,13 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
         rows.append([_cell_str(v) for v in row.values])
 
     text_table = _build_text_table(headers, rows)
+
+    text_table_chars = len(text_table)
+    text_table_lines = text_table.count("\n") + 1
+    est_input_tokens = text_table_chars // 4
+    print(f"[GFD DEBUG] Text table: {kept_rows} data rows, {text_table_lines} lines, "
+          f"{text_table_chars:,} chars (~{est_input_tokens:,} tokens est.)")
+    print(f"[GFD DEBUG] ═══ Stage 1 complete ═══\n")
 
     return {
         "text_table":         text_table,
@@ -612,7 +649,16 @@ structured JSON object.
 
 7. EMPTY / N/A CELLS — use null.
 
-8. EVERY DATA ROW must appear in the output — skip nothing.
+8. ROW COMPLETENESS — CRITICAL
+   — The first column of each data row is a sequential row number (R001, R002, …).
+     Your output must contain EXACTLY as many rows as there are numbered data rows
+     in the input table.  The user message states the exact count.
+   — NEVER merge, deduplicate, or summarise similar-looking rows.  Even if two rows
+     have identical product group, plant, and root cause, they represent SEPARATE
+     risk items and must each appear individually in your output.
+   — After generating your JSON, mentally verify: does the number of rows across
+     all product_groups sum to the exact count stated in the user message?
+     If not, you have missed rows — go back and include them.
 
 ═══ OUTPUT FORMAT ═══
 
@@ -661,12 +707,20 @@ Respond with ONLY valid JSON — no markdown fences, no explanation text.
 _EXTRACT_USER = """\
 Current calendar week: {current_cw}
 Sheet name: {sheet_name}
-Data rows after recency filter: {kept_rows} (of {total_rows} total)
 
-Extract all product groups and risk rows from the table below.
-Remember: rows with the same repeating product family value belong to the same product group.
+The table below contains EXACTLY {kept_rows} data rows (R001–R{kept_rows:03d}), filtered from {total_rows} total.
+Your JSON output MUST contain exactly {kept_rows} rows across all product_groups combined — no more, no fewer.
+Do NOT merge, skip, or summarise any rows even if they look similar.
 
 {text_table}"""
+
+
+def _count_extracted_rows(extracted: dict) -> int:
+    """Count total data rows across all product_groups in the LLM output."""
+    return sum(
+        len(pg.get("rows", []))
+        for pg in extracted.get("product_groups", [])
+    )
 
 
 async def llm_extract_gfd_data(
@@ -674,90 +728,197 @@ async def llm_extract_gfd_data(
     llm_config: dict,
     session_id: str,
     glossary_context: str = "",
+    max_retries: int = 2,
 ) -> dict:
     """
     Stage 2 (LLM): Send the filtered text table to the LLM and extract structured JSON.
 
+    Validates that the number of output rows matches the input row count.
+    If the LLM drops more than 10 % of rows, retries with an explicit reminder.
+
     Returns the parsed extraction dict. On JSON parse failure, returns a minimal
     fallback structure with the error noted in warnings.
     """
-    llm = _create_llm(llm_config, max_tokens=8192)
+    input_rows = stage1["kept_rows"]
+    llm = _create_llm(llm_config, max_tokens=64000)
     t0 = time.time()
+
+    print(f"[GFD DEBUG] ═══ Stage 2: LLM extraction ═══")
+    print(f"[GFD DEBUG] Input: {input_rows} data rows, "
+          f"{len(stage1['headers'])} columns, max_tokens=64000")
 
     glossary_block = (
         f"\n\nCOMPANY GLOSSARY — use these to expand abbreviations correctly:\n{glossary_context}"
         if glossary_context else ""
     )
 
-    messages = [
-        SystemMessage(content=_EXTRACT_SYSTEM.format(glossary_block=glossary_block)),
-        HumanMessage(content=_EXTRACT_USER.format(
-            current_cw=stage1["current_cw"],
-            sheet_name=stage1["sheet_used"],
-            kept_rows=stage1["kept_rows"],
-            total_rows=stage1["total_rows"],
-            text_table=stage1["text_table"],
-        )),
-    ]
+    # ── Save the text table to disk for debugging ────────────────────
+    text_table_path = None
+    if stage1.get("csv_path"):
+        text_table_path = str(Path(stage1["csv_path"]).with_name(
+            Path(stage1["csv_path"]).stem + "_llm_input.txt"
+        ))
+        try:
+            with open(text_table_path, "w", encoding="utf-8") as f:
+                f.write(f"Session: {session_id}\n")
+                f.write(f"Current CW: {stage1['current_cw']}\n")
+                f.write(f"Sheet: {stage1['sheet_used']}\n")
+                f.write(f"Input rows: {input_rows}  (of {stage1['total_rows']} total)\n")
+                f.write(f"Columns: {stage1['headers']}\n")
+                f.write("─" * 80 + "\n\n")
+                f.write(stage1["text_table"])
+            print(f"[GFD DEBUG] LLM input text table saved: {text_table_path}")
+        except Exception as e:
+            print(f"[GFD DEBUG] Could not save text table debug file: {e}")
+            text_table_path = None
 
-    try:
-        response = await llm.ainvoke(messages)
-        raw = response.content.strip()
+    base_system = _EXTRACT_SYSTEM.format(glossary_block=glossary_block)
+    base_user = _EXTRACT_USER.format(
+        current_cw=stage1["current_cw"],
+        sheet_name=stage1["sheet_used"],
+        kept_rows=stage1["kept_rows"],
+        total_rows=stage1["total_rows"],
+        text_table=stage1["text_table"],
+    )
 
-        # Strip markdown fences if the model disobeyed instructions
-        if raw.startswith("```"):
-            raw = "\n".join(raw.split("\n")[1:])
-        if raw.endswith("```"):
-            raw = "\n".join(raw.split("\n")[:-1])
+    attempt = 0
+    extracted: dict = {}
 
-        extracted: dict = json.loads(raw.strip())
+    while attempt <= max_retries:
+        attempt += 1
+        attempt_t0 = time.time()
 
-        usage = response.response_metadata.get("token_usage", {})
-        log_tokens(session_id, "gfd_llm_extract", usage, llm_config.get("azure_deployment", ""))
+        # On retry, append an explicit list of what's missing
+        if attempt == 1:
+            user_msg = base_user
+        else:
+            prev_count = _count_extracted_rows(extracted)
+            user_msg = (
+                base_user
+                + f"\n\n⚠ CRITICAL: Your previous response contained only "
+                  f"{prev_count} rows, but the input has {input_rows} data "
+                  f"rows (R001–R{input_rows:03d}).  You have LOST "
+                  f"{input_rows - prev_count} rows.  Go through the table "
+                  f"row by row and include every single R-numbered row."
+            )
+            print(f"[GFD DEBUG] Retry {attempt}: previous attempt had "
+                  f"{prev_count}/{input_rows} rows")
 
-        n_pgs = len(extracted.get("product_groups", []))
-        n_rows = sum(len(pg.get("rows", [])) for pg in extracted.get("product_groups", []))
-        duration = (time.time() - t0) * 1000
-        log_trace(
-            session_id, "gfd_llm_extract",
-            f"Input: {stage1['kept_rows']} rows, {len(stage1['headers'])} columns",
-            f"Extracted {n_pgs} product groups, {n_rows} rows",
-            duration,
-        )
+        messages = [
+            SystemMessage(content=base_system),
+            HumanMessage(content=user_msg),
+        ]
 
-        # Attach Stage 1 metadata and merge warnings
-        extracted.setdefault("warnings", [])
-        extracted["warnings"] = stage1["warnings"] + extracted["warnings"]
-        extracted["_meta"] = {
-            "headers": stage1["headers"],
-            "original_headers": stage1.get("original_headers", stage1["headers"]),
-            "total_rows_in_file": stage1["total_rows"],
-            "rows_after_filter": stage1["kept_rows"],
-            "sheet_used": stage1["sheet_used"],
-            "date_col_name": stage1.get("date_col_name"),
-            "customer_col_range": stage1.get("customer_col_range"),
-            "csv_path": stage1.get("csv_path"),
-            "filtered_csv_path": stage1.get("filtered_csv_path"),
-        }
-        return extracted
+        try:
+            response = await llm.ainvoke(messages)
+            raw = response.content.strip()
 
-    except json.JSONDecodeError as exc:
-        duration = (time.time() - t0) * 1000
-        log_trace(session_id, "gfd_llm_extract",
-                  f"Input: {stage1['kept_rows']} rows",
-                  f"JSON PARSE ERROR: {str(exc)[:120]}", duration, {"error": True})
-        return _extraction_fallback(stage1, f"LLM returned unparseable JSON: {str(exc)[:200]}")
+            # Strip markdown fences if the model disobeyed instructions
+            if raw.startswith("```"):
+                raw = "\n".join(raw.split("\n")[1:])
+            if raw.endswith("```"):
+                raw = "\n".join(raw.split("\n")[:-1])
 
-    except Exception as exc:
-        duration = (time.time() - t0) * 1000
-        log_trace(session_id, "gfd_llm_extract",
-                  f"Input: {stage1['kept_rows']} rows",
-                  f"ERROR: {str(exc)[:120]}", duration, {"error": True})
-        return _extraction_fallback(stage1, f"LLM extraction failed: {str(exc)[:200]}")
+            extracted = json.loads(raw.strip())
+
+            usage = response.response_metadata.get("token_usage", {})
+            completion_tokens = usage.get("completion_tokens", 0)
+            log_tokens(session_id, f"gfd_llm_extract_attempt{attempt}", usage,
+                       llm_config.get("azure_deployment", ""))
+
+            n_pgs = len(extracted.get("product_groups", []))
+            n_rows_out = _count_extracted_rows(extracted)
+            duration = (time.time() - attempt_t0) * 1000
+
+            print(f"[GFD DEBUG] Attempt {attempt}: LLM returned {n_rows_out}/{input_rows} rows "
+                  f"across {n_pgs} product groups  "
+                  f"(completion_tokens={completion_tokens}, duration={duration:.0f}ms)")
+
+            log_trace(
+                session_id, f"gfd_llm_extract_attempt{attempt}",
+                f"Input: {input_rows} rows, {len(stage1['headers'])} columns",
+                f"Extracted {n_pgs} product groups, {n_rows_out} rows "
+                f"(completion_tokens={completion_tokens})",
+                duration,
+            )
+
+            # ── Row-count validation ─────────────────────────────────
+            if input_rows > 0 and n_rows_out < input_rows:
+                loss_pct = (1 - n_rows_out / input_rows) * 100
+                loss_msg = (
+                    f"Row count mismatch: LLM returned {n_rows_out} of "
+                    f"{input_rows} input rows ({loss_pct:.0f}% loss, "
+                    f"attempt {attempt})"
+                )
+                print(f"[GFD WARNING] {loss_msg}")
+
+                # Tolerate small loss (≤10%) — the LLM may legitimately
+                # skip fully-empty rows; otherwise retry
+                if loss_pct > 10 and attempt <= max_retries:
+                    print(f"[GFD DEBUG] Loss exceeds 10% — will retry")
+                    continue
+
+                extracted.setdefault("warnings", [])
+                extracted["warnings"].append(loss_msg)
+
+            # ── Success — attach Stage 1 metadata ────────────────────
+            extracted.setdefault("warnings", [])
+            extracted["warnings"] = stage1["warnings"] + extracted["warnings"]
+            extracted["_meta"] = {
+                "headers": stage1["headers"],
+                "original_headers": stage1.get("original_headers", stage1["headers"]),
+                "total_rows_in_file": stage1["total_rows"],
+                "rows_after_filter": stage1["kept_rows"],
+                "rows_extracted_by_llm": n_rows_out,
+                "extraction_attempts": attempt,
+                "completion_tokens_used": completion_tokens,
+                "sheet_used": stage1["sheet_used"],
+                "date_col_name": stage1.get("date_col_name"),
+                "customer_col_range": stage1.get("customer_col_range"),
+                "csv_path": stage1.get("csv_path"),
+                "filtered_csv_path": stage1.get("filtered_csv_path"),
+                "text_table_path": text_table_path,
+            }
+
+            total_duration = (time.time() - t0) * 1000
+            log_trace(
+                session_id, "gfd_llm_extract",
+                f"Input: {input_rows} rows, {len(stage1['headers'])} columns",
+                f"Final: {n_pgs} product groups, {n_rows_out} rows "
+                f"(attempts={attempt}, total={total_duration:.0f}ms)",
+                total_duration,
+            )
+            print(f"[GFD DEBUG] ═══ Stage 2 complete ({n_rows_out}/{input_rows} rows, "
+                  f"{attempt} attempt(s)) ═══\n")
+            return extracted
+
+        except json.JSONDecodeError as exc:
+            duration = (time.time() - attempt_t0) * 1000
+            print(f"[GFD ERROR] Attempt {attempt}: JSON parse error — {str(exc)[:120]}")
+            log_trace(session_id, f"gfd_llm_extract_attempt{attempt}",
+                      f"Input: {input_rows} rows",
+                      f"JSON PARSE ERROR: {str(exc)[:120]}", duration, {"error": True})
+            if attempt <= max_retries:
+                continue
+            return _extraction_fallback(stage1, f"LLM returned unparseable JSON: {str(exc)[:200]}")
+
+        except Exception as exc:
+            duration = (time.time() - attempt_t0) * 1000
+            print(f"[GFD ERROR] Attempt {attempt}: {str(exc)[:120]}")
+            log_trace(session_id, f"gfd_llm_extract_attempt{attempt}",
+                      f"Input: {input_rows} rows",
+                      f"ERROR: {str(exc)[:120]}", duration, {"error": True})
+            if attempt <= max_retries:
+                continue
+            return _extraction_fallback(stage1, f"LLM extraction failed: {str(exc)[:200]}")
+
+    # Safety net — should not reach here
+    return _extraction_fallback(stage1, f"All {max_retries + 1} extraction attempts failed")
 
 
 def _extraction_fallback(stage1: dict, error_msg: str) -> dict:
     """Minimal structure returned when LLM extraction fails entirely."""
+    print(f"[GFD FALLBACK] {error_msg}")
     return {
         "current_cw": stage1["current_cw"],
         "sheet_name": stage1["sheet_used"],
@@ -769,6 +930,9 @@ def _extraction_fallback(stage1: dict, error_msg: str) -> dict:
             "original_headers": stage1.get("original_headers", stage1["headers"]),
             "total_rows_in_file": stage1["total_rows"],
             "rows_after_filter": stage1["kept_rows"],
+            "rows_extracted_by_llm": 0,
+            "extraction_attempts": 0,
+            "completion_tokens_used": 0,
             "sheet_used": stage1["sheet_used"],
             "date_col_name": stage1.get("date_col_name"),
             "customer_col_range": stage1.get("customer_col_range"),
