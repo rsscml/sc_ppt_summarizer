@@ -504,11 +504,6 @@ async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(4))
         for pg in extracted.get("product_groups", [])
     ]
 
-    overview_slide = next(
-        (s for s in slide_spec.get("slides", []) if s.get("type") == "overview"),
-        {}
-    )
-
     return {
         "session_id": session_id,
         "filename": file.filename,
@@ -517,8 +512,8 @@ async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(4))
         "rows_after_filter": meta.get("rows_after_filter", 0),
         "history_weeks": history_weeks,
         "product_groups": pg_overview,
-        "overall_risk": overview_slide.get("overall_risk", ""),
-        "slide_count": len(slide_spec.get("slides", [])),
+        "overall_risk": slide_spec.get("overall_risk", ""),
+        "slide_count": slide_spec.get("slide_count", 1),
         "warnings": extracted.get("warnings", []),
         "extraction_notes": extracted.get("extraction_notes", ""),
         "is_fallback": slide_spec.get("_fallback", False),
@@ -570,8 +565,8 @@ async def get_gfd_session(session_id: str):
         "current_cw": extracted.get("current_cw", ""),
         "extraction_notes": extracted.get("extraction_notes", ""),
         "warnings": extracted.get("warnings", []),
-        "overall_risk": overview_slide.get("overall_risk"),
-        "slide_count": len(slide_spec.get("slides", [])),
+        "overall_risk": slide_spec.get("overall_risk", overview_slide.get("overall_risk")),
+        "slide_count": slide_spec.get("slide_count", len(slide_spec.get("slides", []))),
         "is_fallback": slide_spec.get("_fallback", False),
         "product_groups": [
             {

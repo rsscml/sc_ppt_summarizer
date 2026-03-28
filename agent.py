@@ -77,8 +77,8 @@ def create_llm(config: dict) -> AzureChatOpenAI:
         azure_endpoint=config["azure_endpoint"],
         api_key=config["api_key"],
         api_version=config.get("api_version", "2024-12-01-preview"),
-        temperature=0.2,
-        max_tokens=4096,
+        #temperature=0.2,
+        max_tokens=64000,
     )
 
 

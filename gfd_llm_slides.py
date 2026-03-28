@@ -5,29 +5,41 @@ Two-stage pipeline:
 
 Stage 1 — LLM slide spec:
   Receives the structured JSON from gfd_llm_parser and generates a complete
-  slide specification — RAG colors, condensed cell text, groupings, overview
-  bullets, risk assessments. The LLM makes ALL content and layout decisions.
+  slide specification — RAG colors, condensed cell text, groupings, KB coverage
+  strings. The LLM makes ALL content decisions.
 
 Stage 2 — PPTX renderer:
   A thin "paint by numbers" renderer that converts the slide spec JSON into a
-  python-pptx Presentation object. No business logic lives here — the renderer
-  just maps JSON fields to shapes, colors, and text runs.
+  python-pptx Presentation object that matches the corporate GFD template:
+  - 10 × 5.625 inch slides (standard 16:9)
+  - 14-column table: Product Group | Plant | Customer/Channel | KB Coverage |
+    6 × CW | Quarter | Supplier | Comment | FM Detail Letter
+  - 2-row merged header (dark-blue text headers + green CW band)
+  - Product-group column with vertical merge and amber background
+  - RAG-coloured CW cells (GREEN / AMBER / RED)
+  - Corporate font (Arial) and colour scheme
 
 If Stage 1 fails, a deterministic fallback computes RAG colors arithmetically
 from the integer coverage CW fields produced by the extractor, so the user
 always gets a working dashboard even on LLM error.
+
+When a corporate template PPTX is available, it is loaded as the base
+presentation so that theme colours, logos, and slide-master styling are
+preserved exactly.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import math
 import time
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from pptx.oxml.ns import qn
@@ -39,110 +51,99 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from agent import log_tokens, log_trace
 
 
-# ─── LLM factory (local, higher max_tokens for large JSON output) ─────
+# ─── Template path ───────────────────────────────────────────────────
 
-def _create_llm(config: dict, max_tokens: int = 8192) -> AzureChatOpenAI:
+TEMPLATE_PATH = Path(__file__).parent / "gfd_ppt_template.pptx"
+
+
+# ─── LLM factory ────────────────────────────────────────────────────
+
+def _create_llm(config: dict, max_tokens: int = 64000) -> AzureChatOpenAI:
     return AzureChatOpenAI(
         azure_deployment=config["azure_deployment"],
         azure_endpoint=config["azure_endpoint"],
         api_key=config["api_key"],
         api_version=config.get("api_version", "2024-12-01-preview"),
-        temperature=0.15,
+        #temperature=0.15,
         max_tokens=max_tokens,
     )
 
 
-# ─── Color palette ────────────────────────────────────────────────────
+# ─── Colour palette (matching the corporate GFD template) ───────────
 
 _C: dict[str, RGBColor] = {
-    "GREEN":      RGBColor(0x00, 0xB0, 0x50),
-    "AMBER":      RGBColor(0xFF, 0xC0, 0x00),
-    "RED":        RGBColor(0xC0, 0x00, 0x00),
-    "GREY":       RGBColor(0xA0, 0xA0, 0xA0),
-    "WHITE":      RGBColor(0xFF, 0xFF, 0xFF),
-    "BLACK":      RGBColor(0x1A, 0x1A, 0x1A),
-    "NAVY":       RGBColor(0x1E, 0x27, 0x61),
-    "BLUE":       RGBColor(0x2C, 0x52, 0x82),
-    "LIGHT_BLUE": RGBColor(0xBF, 0xD7, 0xED),
-    "LIGHT_GREY": RGBColor(0xF4, 0xF4, 0xF6),
-    "MEDIUM_ORANGE": RGBColor(0xFF, 0x99, 0x00),
+    "HDR_BLUE":     RGBColor(0x00, 0x45, 0x7E),   # dk2/tx2 — header text columns
+    "HDR_GREEN":    RGBColor(0x00, 0x80, 0x00),   # CW header band
+    "GREEN":        RGBColor(0x00, 0xB0, 0x50),   # RAG green (data cells)
+    "AMBER":        RGBColor(0xFF, 0xC0, 0x00),   # RAG amber + product-group bg
+    "RED":          RGBColor(0xFF, 0x00, 0x00),   # RAG red
+    "GREY":         RGBColor(0xA0, 0xA0, 0xA0),   # no-data
+    "WHITE":        RGBColor(0xFF, 0xFF, 0xFF),
+    "BLACK":        RGBColor(0x00, 0x00, 0x00),
 }
 
-_RAG_FG: dict[str, RGBColor] = {
-    "GREEN": _C["WHITE"],
-    "AMBER": _C["BLACK"],
-    "RED":   _C["WHITE"],
-    "GREY":  _C["WHITE"],
+_RAG_BG: dict[str, RGBColor] = {
+    "GREEN": _C["GREEN"],
+    "AMBER": _C["AMBER"],
+    "RED":   _C["RED"],
+    "GREY":  _C["GREY"],
 }
 
-_RISK_BG: dict[str, RGBColor] = {
-    "CRITICAL": _C["RED"],
-    "HIGH":     _C["AMBER"],
-    "MEDIUM":   _C["MEDIUM_ORANGE"],
-    "LOW":      _C["GREEN"],
-}
-_RISK_FG: dict[str, RGBColor] = {
-    "CRITICAL": _C["WHITE"],
-    "HIGH":     _C["BLACK"],
-    "MEDIUM":   _C["BLACK"],
-    "LOW":      _C["WHITE"],
-}
+# Slide dimensions — standard 16:9 matching the template
+_W  = Inches(10.0)
+_H  = Inches(5.625)
 
-# Slide dimensions — widescreen 16:9
-_W  = Inches(13.333)
-_H  = Inches(7.5)
-_M  = Inches(0.28)     # side margin
-_HH = Inches(0.62)     # header bar height
+# Table position and geometry — matched from template
+_TBL_LEFT = Emu(200938)     # 0.220 in
+_TBL_TOP  = Emu(388775)     # 0.425 in
 
-FONT = "Calibri"
+# Title position — matched from template placeholder
+_TITLE_LEFT   = Emu(200938)
+_TITLE_TOP    = Emu(111776)
+_TITLE_WIDTH  = Emu(8639908)
+_TITLE_HEIGHT = Emu(276999)
+
+FONT = "Arial"
+
+# Column widths in EMU — matched from template
+_COL_WIDTHS_EMU = [
+    882650,    # col 0: Product Group (PG)     — 0.965 in
+    312545,    # col 1: Plant                  — 0.342 in
+    1524318,   # col 2: Customer / Channel     — 1.667 in
+    576611,    # col 3: KB Coverage (CW/YY)    — 0.631 in
+    192832,    # col 4: CW+0                   — 0.211 in
+    192832,    # col 5: CW+1
+    192832,    # col 6: CW+2
+    192832,    # col 7: CW+3
+    192832,    # col 8: CW+4
+    192832,    # col 9: CW+5
+    192832,    # col 10: Quarter               — 0.211 in
+    1785894,   # col 11: Supplier              — 1.953 in
+    1132964,   # col 12: Comment               — 1.239 in
+    698178,    # col 13: FM Detail Letter       — 0.764 in
+]
+_N_COLS        = len(_COL_WIDTHS_EMU)
+_N_CW_COLS     = 6          # CW columns (cols 4–9)
+_CW_COL_START  = 4          # first CW column index
+_Q_COL         = 10         # quarter column index
+_N_FIXED_LEFT  = 4          # text columns before CW band (0–3)
+_N_FIXED_RIGHT = 3          # text columns after CW band (11–13)
+
+# Max data rows per slide (excluding 2-row header).  The template comfortably
+# fits ~24 data rows within 4.8 in of table height.
+_MAX_ROWS_PER_SLIDE = 24
+
+# Header row height
+_HDR_ROW_H = Emu(231700)    # row 0 — 0.253 in
+_HDR_SUB_H = Emu(385020)    # row 1 — 0.421 in (CW numbers row)
 
 
-# ─── Low-level python-pptx helpers ───────────────────────────────────
-
-def _solid(shape, rgb: RGBColor) -> None:
-    """Solid fill + no border on a shape."""
-    shape.fill.solid()
-    shape.fill.fore_color.rgb = rgb
-    shape.line.fill.background()
-
-
-def _rect(slide, x, y, w, h, rgb: RGBColor):
-    """Add a filled rectangle (MSO_AUTO_SHAPE_TYPE.RECTANGLE = 1)."""
-    s = slide.shapes.add_shape(1, int(x), int(y), int(w), int(h))
-    _solid(s, rgb)
-    return s
-
-
-def _tb(slide, x, y, w, h, text: str, *,
-        size: int = 10, bold: bool = False,
-        color: RGBColor = None, align=PP_ALIGN.LEFT,
-        bg: RGBColor = None) -> Any:
-    """Add a textbox. bg=None → transparent fill."""
-    tb = slide.shapes.add_textbox(int(x), int(y), int(w), int(h))
-    if bg:
-        tb.fill.solid()
-        tb.fill.fore_color.rgb = bg
-    else:
-        tb.fill.background()
-    tf = tb.text_frame
-    tf.word_wrap = True
-    p = tf.paragraphs[0]
-    p.alignment = align
-    run = p.add_run()
-    run.text = text or ""
-    run.font.name = FONT
-    run.font.size = Pt(size)
-    run.font.bold = bold
-    if color:
-        run.font.color.rgb = color
-    return tb
-
+# ─── Low-level python-pptx helpers ──────────────────────────────────
 
 def _cell_fill(cell, rgb: RGBColor) -> None:
     """Set solid background fill on a table cell via XML."""
     tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
-    # Remove any existing fill elements
     for child in list(tcPr):
         local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
         if local in ("solidFill", "gradFill", "noFill", "pattFill", "blipFill"):
@@ -152,18 +153,52 @@ def _cell_fill(cell, rgb: RGBColor) -> None:
     clr.set("val", f"{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}")
 
 
+def _cell_margins_zero(cell, anchor: str = "ctr") -> None:
+    """Set cell-level margins to zero and vertical anchor via tcPr XML.
+    This matches the corporate template where all data cells have marL/R/T/B=0."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcPr.set("marL", "0")
+    tcPr.set("marR", "0")
+    tcPr.set("marT", "0")
+    tcPr.set("marB", "0")
+    tcPr.set("anchor", anchor)
+
+
+def _para_spacing_zero(p) -> None:
+    """Set paragraph spacing to 0pt before/after and 100% line spacing."""
+    pPr = p._p.get_or_add_pPr()
+    # spcBef
+    for old in pPr.findall(qn("a:spcBef")):
+        pPr.remove(old)
+    sb = etree.SubElement(pPr, qn("a:spcBef"))
+    etree.SubElement(sb, qn("a:spcPts")).set("val", "0")
+    # spcAft
+    for old in pPr.findall(qn("a:spcAft")):
+        pPr.remove(old)
+    sa = etree.SubElement(pPr, qn("a:spcAft"))
+    etree.SubElement(sa, qn("a:spcPts")).set("val", "0")
+    # lnSpc
+    for old in pPr.findall(qn("a:lnSpc")):
+        pPr.remove(old)
+    ls = etree.SubElement(pPr, qn("a:lnSpc"))
+    etree.SubElement(ls, qn("a:spcPct")).set("val", "100000")
+
+
 def _cell_write(cell, text: str, *,
-                size: int = 7, bold: bool = False,
-                color: RGBColor = None, align=PP_ALIGN.LEFT) -> None:
+                size: int = 6, bold: bool = False,
+                color: RGBColor | None = None,
+                align=PP_ALIGN.LEFT) -> None:
     """Write text into a table cell, clearing previous content."""
+    _cell_margins_zero(cell)
     tf = cell.text_frame
     tf.word_wrap = True
+
     p = tf.paragraphs[0]
     p.alignment = align
-    # Remove extra runs from first paragraph
+    _para_spacing_zero(p)
     for r in list(p.runs):
         p._p.remove(r._r)
-    # Remove extra paragraphs
     for extra in list(tf.paragraphs)[1:]:
         extra._p.getparent().remove(extra._p)
     run = p.add_run()
@@ -175,105 +210,189 @@ def _cell_write(cell, text: str, *,
         run.font.color.rgb = color
 
 
-# ─── Stage 1: LLM slide spec ─────────────────────────────────────────
+def _cell_write_multiline(cell, text: str, *,
+                          size: int = 6, bold: bool = False,
+                          color: RGBColor | None = None,
+                          align=PP_ALIGN.LEFT) -> None:
+    """Write multi-line text (newline-separated) into a table cell."""
+    _cell_margins_zero(cell)
+    tf = cell.text_frame
+    tf.word_wrap = True
+
+    # Clear existing content
+    for r in list(tf.paragraphs[0].runs):
+        tf.paragraphs[0]._p.remove(r._r)
+    for extra in list(tf.paragraphs)[1:]:
+        extra._p.getparent().remove(extra._p)
+
+    lines = str(text).split("\n") if text else [""]
+    for i, line in enumerate(lines):
+        if i == 0:
+            p = tf.paragraphs[0]
+        else:
+            p = tf.add_paragraph()
+        p.alignment = align
+        _para_spacing_zero(p)
+        run = p.add_run()
+        run.text = line
+        run.font.name = FONT
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        if color:
+            run.font.color.rgb = color
+
+
+def _merge_cells(tbl, r1: int, c1: int, r2: int, c2: int) -> None:
+    """Merge table cells from (r1,c1) to (r2,c2) inclusive."""
+    tbl.cell(r1, c1).merge(tbl.cell(r2, c2))
+
+
+# ─── Template loading ───────────────────────────────────────────────
+
+def _load_base_presentation(template_path: str | Path | None = None) -> tuple:
+    """
+    Load the corporate template PPTX as the base presentation.
+
+    Returns (prs, layout) where layout is the slide layout to use for
+    new slides.  If the template is unavailable, creates a blank
+    presentation with matching dimensions and returns (prs, None).
+    """
+    tpl = Path(template_path) if template_path else TEMPLATE_PATH
+
+    if tpl.exists():
+        prs = Presentation(str(tpl))
+
+        # Capture the layout used by the first (example) slide
+        layout = prs.slides[0].slide_layout if len(prs.slides) > 0 else None
+
+        # Delete all existing slides (they contain example data)
+        sld_id_lst = prs.slides._sldIdLst
+        for sld_id in list(sld_id_lst):
+            rId = sld_id.get(qn("r:id"))
+            prs.part.drop_rel(rId)
+            sld_id_lst.remove(sld_id)
+
+        return prs, layout
+
+    # Fallback: create a blank presentation with matching dimensions
+    prs = Presentation()
+    prs.slide_width  = _W
+    prs.slide_height = _H
+    return prs, None
+
+
+def _add_slide(prs: Presentation, layout) -> Any:
+    """Add a slide using the template layout (or blank if unavailable)."""
+    if layout is not None:
+        return prs.slides.add_slide(layout)
+    # Fallback: use blank layout (index 6 is typically blank)
+    blank_idx = min(6, len(prs.slide_layouts) - 1)
+    return prs.slides.add_slide(prs.slide_layouts[blank_idx])
+
+
+# ─── Stage 1: LLM slide spec ────────────────────────────────────────
 
 _SLIDES_SYSTEM = """\
-You are a Chief Supply Chain Officer designing a Global Fulfilment Dashboard PowerPoint
-presentation for a board-level audience. You are given JSON extracted from the
-Dashboard_Update worksheet. Generate a COMPLETE slide specification in JSON.
+You are a Chief Supply Chain Officer designing a Global Fulfilment Dashboard
+presentation for a board-level audience.  You are given JSON extracted from
+the Dashboard_Update worksheet.  Generate a COMPLETE slide specification as JSON.
 
-═══ SLIDE DESIGN RULES ═══
+═══ DASHBOARD TABLE DESIGN ═══
 
-SLIDE 1 — Executive Overview (type: "overview")
-  • overall_risk: worst-case across ALL rows (CRITICAL > HIGH > MEDIUM > LOW).
-  • 4–6 bullet points (max 110 chars each). Lead with the most critical items.
-    Every bullet must cite specific facts: CW numbers, plant names, counts.
-  • stats: count risk items by risk level.
+The dashboard is a SINGLE TABLE containing ALL product groups.  Each row represents
+one plant-level risk item.  Rows belonging to the same product group are listed
+consecutively (they will be visually grouped via vertical merge on the slide).
 
-SLIDES 2+ — One slide per product group (type: "product_group")
-  • If a product group has >9 rows, split it into multiple slides with a
-    "(cont.)" suffix on the title.
-  • title: "Product Group Desc (CODE)" — use actual codes and descriptions.
-  • headline: 1-sentence situation summary (max 80 chars). Be specific.
-  • cw_columns: list of exactly 12 consecutive CW integers starting from
-    the current CW number (e.g. if current is CW13 → [13,14,15,16,17,18,19,20,21,22,23,24]).
-    Handle year-end wrap correctly (e.g. CW51,52,1,2,...).
-  • quarter_label: next quarter label (e.g. "Q2/2026").
+COLUMNS (in order):
+  product_group  — "Name\\n(code)" format, e.g. "Compressors\\n(11)".
+                   Every row in the same group must have the IDENTICAL value.
+  plant          — Plant location code, ≤ 15 chars
+  customer       — Customer or channel name, ≤ 40 chars.  May be empty.
+  kb_coverage    — KB coverage to customer as compact text (e.g. "CW17/18\\nCW21").
+                   Combine coverage-without and coverage-with values on separate lines.
+                   If only one value, use a single line.  Use "CWnn" format.
+  cw_colors      — Object mapping each of the 6 CW column numbers (as strings)
+                   to a RAG colour: "GREEN", "AMBER", "RED", or "GREY".
+  quarter_color  — Single RAG colour for the quarter column.
+  supplier       — Supplier name or description, ≤ 60 chars
+  comment        — Action / comment text, ≤ 90 chars
+  fm_detail      — Force Majeure detail letter status, ≤ 30 chars
 
-RAG COLOR COMPUTATION (per row, per CW column):
+CW COLUMNS:
+  Exactly 6 consecutive calendar-week integers starting from the current CW.
+  Handle year-end wrap (e.g. CW50,51,52,1,2,3).
+
+QUARTER:
+  The quarter that follows the 6-week CW window (e.g. "Q2" or "Q3/2026").
+
+RAG COLOUR COMPUTATION (per row, per CW column):
   Given coverage_without_mitigation_cw (W) and coverage_with_mitigation_cw (M):
-    • "GREEN" if CW ≤ W  (supply secured without mitigation)
-    • "AMBER" if W < CW ≤ M  (supply depends on mitigation actions)
-    • "RED"   if CW > M  (no supply plan in place)
+    • "GREEN" if CW ≤ W   (supply secured without mitigation)
+    • "AMBER" if W < CW ≤ M   (supply depends on mitigation)
+    • "RED"   if CW > M   (no supply plan in place)
     • If M is null but W is set: "GREEN" if CW ≤ W, else "RED"
     • If both are null: "GREY"
-  quarter_color = worst RAG across all 13 weeks of that quarter
+  quarter_color = worst RAG across ALL weeks of that quarter
   (RED > AMBER > GREEN > GREY).
-
-RISK LEVEL (per row):
-  CRITICAL = any CW in cw_columns is RED
-  HIGH     = at least one AMBER, no RED
-  MEDIUM   = all GREEN but ≤ 3 week safety margin beyond the last CW column
-  LOW      = comfortably all GREEN
-
-TEXT CONDENSING for slide display (applied to each row field):
-  component ≤ 45 chars, plant ≤ 15 chars, customer ≤ 40 chars,
-  supplier ≤ 30 chars, action ≤ 90 chars, fm_status ≤ 15 chars.
 
 ═══ OUTPUT FORMAT ═══
 
-Respond with ONLY valid JSON — no markdown fences, no explanation:
+Respond with ONLY valid JSON — no markdown fences, no explanation text.
 
 {{
   "presentation_title": "Global Fulfilment Dashboard",
   "current_cw": "CW13/2026",
-  "generated_date": "{today}",
-  "slides": [
+  "cw_columns": [13, 14, 15, 16, 17, 18],
+  "quarter_label": "Q2",
+  "overall_risk": "HIGH",
+  "stats": {{
+    "total_items": 24,
+    "red_count": 12,
+    "amber_count": 5,
+    "green_count": 7
+  }},
+  "rows": [
     {{
-      "type": "overview",
-      "title": "Situation Overview — CW13/2026",
-      "overall_risk": "HIGH",
-      "bullets": ["3 plants at RED from CW16 — BMW Group coverage expires CW15", "..."],
-      "stats": {{
-        "total_items": 12,
-        "critical_count": 2,
-        "high_count": 4,
-        "medium_count": 4,
-        "low_count": 2,
-        "product_groups_count": 3
-      }}
+      "product_group": "Compressors\\n(11)",
+      "plant": "LIS",
+      "customer": "",
+      "kb_coverage": "CW17/18\\nCW21\\nCW17",
+      "cw_colors": {{"13":"GREEN","14":"GREEN","15":"GREEN","16":"GREEN","17":"GREEN","18":"RED"}},
+      "quarter_color": "RED",
+      "supplier": "Supplier Corp.",
+      "comment": "Dual source activation by CW14",
+      "fm_detail": "sent"
     }},
     {{
-      "type": "product_group",
-      "title": "Sensors / Radar (SEN)",
-      "headline": "NXP wafer shortage — BHV at RED from CW16, mitigation active",
-      "cw_columns": [13,14,15,16,17,18,19,20,21,22,23,24],
-      "quarter_label": "Q2/2026",
-      "rows": [
-        {{
-          "plant": "BHV",
-          "customer": "BMW Group, Mercedes-Benz",
-          "component": "NXP S32K wafer",
-          "supplier": "NXP Semiconductors",
-          "coverage_without": 15,
-          "coverage_with": 19,
-          "action": "Dual source by CW14; air freight bridge until CW18",
-          "fm_status": "In progress",
-          "risk_level": "HIGH",
-          "cw_colors": {{"13":"GREEN","14":"GREEN","15":"GREEN","16":"AMBER","17":"AMBER","18":"AMBER","19":"AMBER","20":"RED","21":"RED","22":"RED","23":"RED","24":"RED"}},
-          "quarter_color": "RED"
-        }}
-      ]
+      "product_group": "Compressors\\n(11)",
+      "plant": "LIB",
+      "customer": "BMW Group",
+      "kb_coverage": "CW21",
+      "cw_colors": {{"13":"GREEN","14":"GREEN","15":"GREEN","16":"GREEN","17":"GREEN","18":"GREEN"}},
+      "quarter_color": "RED",
+      "supplier": "",
+      "comment": "",
+      "fm_detail": ""
     }}
   ]
 }}
+
+IMPORTANT:
+  • EVERY data row from the extraction must appear — skip nothing.
+  • Rows of the same product group MUST be listed consecutively with the
+    EXACT SAME product_group string value (the renderer uses this to merge cells).
+  • overall_risk = worst single RAG across ALL rows and CW columns.
+    Map: any RED → "CRITICAL" or "HIGH", all AMBER → "MEDIUM", all GREEN → "LOW".
+  • stats.red_count / amber_count / green_count = number of rows whose worst CW
+    colour is RED / AMBER / GREEN respectively.
 {glossary_block}"""
 
 _SLIDES_USER = """\
 Today: {today}
 Current calendar week: {current_cw}
 
-Generate the complete dashboard slide specification from this extracted data:
+Generate the complete dashboard slide specification from this extracted data.
+Use exactly 6 CW columns starting from the current week number.
 
 {extracted_json}"""
 
@@ -287,7 +406,7 @@ async def llm_generate_slide_spec(
     """
     Stage 1: LLM generates a complete slide specification from extracted data.
 
-    Returns a dict with a "slides" list. Falls back to a deterministic spec on error.
+    Returns a dict with a "rows" list.  Falls back to a deterministic spec on error.
     """
     llm = _create_llm(llm_config, max_tokens=8192)
     t0 = time.time()
@@ -298,7 +417,6 @@ async def llm_generate_slide_spec(
         f"\n\nCOMPANY GLOSSARY:\n{glossary_context}" if glossary_context else ""
     )
 
-    # Exclude internal metadata keys from what the LLM sees
     clean = {k: v for k, v in extracted.items() if not k.startswith("_")}
     extracted_json = json.dumps(clean, indent=2, ensure_ascii=False)
 
@@ -328,12 +446,12 @@ async def llm_generate_slide_spec(
         usage = response.response_metadata.get("token_usage", {})
         log_tokens(session_id, "gfd_llm_slide_spec", usage, llm_config.get("azure_deployment", ""))
 
-        n_slides = len(spec.get("slides", []))
+        n_rows = len(spec.get("rows", []))
         duration = (time.time() - t0) * 1000
         log_trace(
             session_id, "gfd_llm_slide_spec",
             f"Input: {len(extracted.get('product_groups', []))} product groups",
-            f"Generated {n_slides} slide specs",
+            f"Generated spec with {n_rows} rows",
             duration,
         )
         return spec
@@ -355,9 +473,7 @@ async def llm_generate_slide_spec(
         return _deterministic_fallback_spec(extracted)
 
 
-# ─── Deterministic fallback spec ─────────────────────────────────────
-# Used only when the slide-spec LLM call fails. Computes RAG colors
-# arithmetically from the integer coverage CW fields the extractor produced.
+# ─── Deterministic fallback spec ────────────────────────────────────
 
 def _cw_color(cw_num: int, cov_wo: int | None, cov_w: int | None) -> str:
     if cov_wo is None and cov_w is None:
@@ -381,346 +497,390 @@ def _deterministic_fallback_spec(extracted: dict) -> dict:
     Fallback: compute slide spec without LLM using arithmetic RAG logic.
     Produces a correct dashboard but with less polished text than the LLM version.
     """
-    from datetime import datetime as _dt
+    import re as _re
 
     current_cw_str = extracted.get("current_cw", "CW1/2026")
-    m = __import__("re").match(r"CW(\d+)/(\d+)", current_cw_str)
+    m = _re.match(r"CW(\d+)/(\d+)", current_cw_str)
     if m:
         cw_start, cw_year = int(m.group(1)), int(m.group(2))
     else:
-        iso = _dt.now().isocalendar()
+        iso = datetime.now().isocalendar()
         cw_start, cw_year = iso.week, iso.year
 
-    # 12 consecutive CW numbers with year-end wrap
+    # 6 consecutive CW numbers with year-end wrap
     cw_columns: list[int] = []
-    for i in range(12):
+    for i in range(6):
         w = ((cw_start - 1 + i) % 52) + 1
         cw_columns.append(w)
 
-    # Quarter for the last CW in the range
+    # Quarter label
     last_cw = cw_columns[-1]
-    q_num = (last_cw - 1) // 13 + 2  # next quarter after current
-    q_label = f"Q{min(q_num, 4)}/{cw_year}"
+    q_num = (last_cw - 1) // 13 + 2
+    q_label = f"Q{min(q_num, 4)}"
 
-    all_risk_levels = []
-    pg_slides = []
+    all_rows: list[dict] = []
+    red_count = 0
+    amber_count = 0
+    green_count = 0
 
     for pg in extracted.get("product_groups", []):
         code = pg.get("product_family_code", "")
         desc = pg.get("product_family_desc", "Unknown")
-        title = f"{desc} ({code})" if code else desc
+        pg_label = f"{desc}\n({code})" if code else desc
 
-        slide_rows = []
         for row in pg.get("rows", []):
             cov_wo: int | None = row.get("coverage_without_mitigation_cw")
             cov_w:  int | None = row.get("coverage_with_mitigation_cw")
 
             cw_colors = {str(cw): _cw_color(cw, cov_wo, cov_w) for cw in cw_columns}
             all_colors = list(cw_colors.values())
-            quarter_colors = [_cw_color(w, cov_wo, cov_w)
-                              for w in range((q_num - 2) * 13 + 1, (q_num - 1) * 13 + 1)
-                              if 1 <= w <= 52]
+
+            # Quarter color
+            quarter_weeks = range((q_num - 2) * 13 + 1, (q_num - 1) * 13 + 1)
+            quarter_colors = [_cw_color(w, cov_wo, cov_w) for w in quarter_weeks if 1 <= w <= 52]
             quarter_color = _worst_rag(quarter_colors) if quarter_colors else _worst_rag(all_colors)
 
+            # KB coverage text
+            parts = []
+            if cov_wo is not None:
+                parts.append(f"CW{cov_wo}")
+            if cov_w is not None and cov_w != cov_wo:
+                parts.append(f"CW{cov_w}")
+            kb_coverage = "\n".join(parts) if parts else ""
+
             worst = _worst_rag(all_colors)
-            risk_level = {"RED": "CRITICAL", "AMBER": "HIGH", "GREEN": "LOW", "GREY": "LOW"}.get(worst, "MEDIUM")
-            all_risk_levels.append(risk_level)
+            if worst == "RED":
+                red_count += 1
+            elif worst == "AMBER":
+                amber_count += 1
+            else:
+                green_count += 1
 
-            slide_rows.append({
-                "plant":           (row.get("plant_location") or "")[:15],
-                "customer":        (row.get("customer_affected") or "")[:40],
-                "component":       (row.get("critical_component") or "")[:45],
-                "supplier":        (row.get("supplier_text") or "")[:30],
-                "coverage_without": cov_wo,
-                "coverage_with":    cov_w,
-                "action":          (row.get("action_comment") or "")[:90],
-                "fm_status":       str(row.get("customer_informed") or "N/A")[:15],
-                "risk_level":      risk_level,
-                "cw_colors":       cw_colors,
-                "quarter_color":   quarter_color,
+            all_rows.append({
+                "product_group":  pg_label,
+                "plant":          (row.get("plant_location") or "")[:15],
+                "customer":       (row.get("customer_affected") or "")[:40],
+                "kb_coverage":    kb_coverage,
+                "cw_colors":      cw_colors,
+                "quarter_color":  quarter_color,
+                "supplier":       (row.get("supplier_text") or "")[:60],
+                "comment":        (row.get("action_comment") or "")[:90],
+                "fm_detail":      str(row.get("customer_informed") or "")[:30],
             })
 
-        # Paginate at 9 rows per slide
-        for page_i in range(0, max(len(slide_rows), 1), 9):
-            chunk = slide_rows[page_i: page_i + 9]
-            suffix = f" (cont. {page_i // 9 + 1})" if page_i > 0 else ""
-            pg_slides.append({
-                "type":          "product_group",
-                "title":         title + suffix,
-                "headline":      f"{len(chunk)} risk item(s) — see CW coverage grid",
-                "cw_columns":    cw_columns,
-                "quarter_label": q_label,
-                "rows":          chunk,
-            })
-
-    # Build overview stats
-    risk_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
-    overall_risk = max(all_risk_levels, key=lambda r: risk_rank.get(r, 0), default="HIGH")
-
-    total = sum(len(pg.get("rows", [])) for pg in extracted.get("product_groups", []))
-
-    overview = {
-        "type":         "overview",
-        "title":        f"Situation Overview — {current_cw_str}",
-        "overall_risk": overall_risk,
-        "bullets": [
-            f"{len(extracted.get('product_groups', []))} product group(s) with active fulfilment risks",
-            f"{total} risk items tracked — see per-group slides for CW coverage detail",
-            "(LLM slide generation used deterministic fallback — reprocess to get AI narrative)",
-        ],
-        "stats": {
-            "total_items":          total,
-            "critical_count":       all_risk_levels.count("CRITICAL"),
-            "high_count":           all_risk_levels.count("HIGH"),
-            "medium_count":         all_risk_levels.count("MEDIUM"),
-            "low_count":            all_risk_levels.count("LOW"),
-            "product_groups_count": len(extracted.get("product_groups", [])),
-        },
-    }
+    total = len(all_rows)
+    if red_count > 0:
+        overall_risk = "HIGH"
+    elif amber_count > 0:
+        overall_risk = "MEDIUM"
+    else:
+        overall_risk = "LOW"
 
     return {
         "presentation_title": "Global Fulfilment Dashboard",
         "current_cw":         current_cw_str,
-        "generated_date":     date.today().isoformat(),
+        "cw_columns":         cw_columns,
+        "quarter_label":      q_label,
+        "overall_risk":       overall_risk,
+        "stats": {
+            "total_items":  total,
+            "red_count":    red_count,
+            "amber_count":  amber_count,
+            "green_count":  green_count,
+        },
         "_fallback":          True,
-        "slides":             [overview] + pg_slides,
+        "rows":               all_rows,
     }
 
 
-# ─── Stage 2: PPTX renderer ──────────────────────────────────────────
+# ─── Stage 2: PPTX renderer ────────────────────────────────────────
 
-def _render_overview(prs: Presentation, spec: dict) -> None:
-    """Render the executive overview slide."""
-    slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank
+def _compute_product_group_ranges(rows: list[dict]) -> list[tuple[int, int, str]]:
+    """
+    Identify consecutive row spans that share the same product_group value.
 
-    title        = spec.get("title", "Global Fulfilment Dashboard")
-    overall_risk = spec.get("overall_risk", "HIGH").upper()
-    bullets      = spec.get("bullets", [])
-    stats        = spec.get("stats", {})
+    Returns a list of (start_idx, end_idx, group_label) tuples
+    where start_idx and end_idx are inclusive 0-based data-row indices.
+    """
+    if not rows:
+        return []
 
-    # ── Header bar ────────────────────────────────────────────────────
-    _rect(slide, 0, 0, _W, _HH, _C["NAVY"])
-    _tb(slide, _M, Inches(0.1), Inches(10.5), Inches(0.45),
-        title, size=20, bold=True, color=_C["WHITE"])
+    ranges: list[tuple[int, int, str]] = []
+    current_group = rows[0].get("product_group", "")
+    start = 0
 
-    # Risk badge (top-right corner of header)
-    badge_w = Inches(1.75)
-    badge_x = _W - badge_w - _M
-    _rect(slide, badge_x, Inches(0.09), badge_w, Inches(0.44),
-          _RISK_BG.get(overall_risk, _C["AMBER"]))
-    _tb(slide, badge_x, Inches(0.09), badge_w, Inches(0.44),
-        f"● {overall_risk} RISK",
-        size=11, bold=True,
-        color=_RISK_FG.get(overall_risk, _C["BLACK"]),
-        align=PP_ALIGN.CENTER)
+    for i in range(1, len(rows)):
+        grp = rows[i].get("product_group", "")
+        if grp != current_group:
+            ranges.append((start, i - 1, current_group))
+            current_group = grp
+            start = i
+    ranges.append((start, len(rows) - 1, current_group))
 
-    # ── Stats bar ─────────────────────────────────────────────────────
-    bar_y  = _HH + Inches(0.1)
-    bar_h  = Inches(0.68)
-    stat_w = Inches(2.38)
-    sx     = _M
-
-    for key, label, bg, fg in [
-        ("critical_count", "CRITICAL", _C["RED"],          _C["WHITE"]),
-        ("high_count",     "HIGH",     _C["AMBER"],        _C["BLACK"]),
-        ("medium_count",   "MEDIUM",   _C["MEDIUM_ORANGE"],_C["BLACK"]),
-        ("low_count",      "LOW",      _C["GREEN"],        _C["WHITE"]),
-    ]:
-        count = stats.get(key, 0)
-        _rect(slide, sx, bar_y, stat_w, bar_h, bg)
-        _tb(slide, sx, bar_y, stat_w, bar_h,
-            f"{count}  {label}",
-            size=13, bold=True, color=fg, align=PP_ALIGN.CENTER)
-        sx += stat_w + Inches(0.12)
-
-    # Item / PG summary (right-aligned in stats bar)
-    total = stats.get("total_items", 0)
-    pgs   = stats.get("product_groups_count", 0)
-    _tb(slide, Inches(10.4), bar_y + Inches(0.19), Inches(2.6), Inches(0.32),
-        f"{total} items  ·  {pgs} product groups",
-        size=8, color=_C["BLACK"], align=PP_ALIGN.RIGHT)
-
-    # ── Section label ─────────────────────────────────────────────────
-    sub_y = bar_y + bar_h + Inches(0.14)
-    _tb(slide, _M, sub_y, Inches(12.5), Inches(0.26),
-        "KEY RISK HIGHLIGHTS",
-        size=8, bold=True, color=_C["BLUE"])
-    sub_y += Inches(0.29)
-
-    # ── Bullets ───────────────────────────────────────────────────────
-    remaining = _H - sub_y - _M
-    per_bullet = min(remaining / max(len(bullets), 1), Inches(0.65))
-    for bullet in bullets:
-        _tb(slide, Inches(0.55), sub_y, Inches(12.1), per_bullet,
-            f"▸  {bullet}", size=11, color=_C["BLACK"])
-        sub_y += per_bullet
-
-    # ── Footer ────────────────────────────────────────────────────────
-    gen_date = date.today().isoformat()
-    _tb(slide, Inches(10.0), _H - Inches(0.28), Inches(3.0), Inches(0.24),
-        f"Generated {gen_date}", size=7,
-        color=_C["GREY"], align=PP_ALIGN.RIGHT)
+    return ranges
 
 
-def _render_product_group(prs: Presentation, spec: dict) -> None:
-    """Render a single product-group RAG heatmap slide."""
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
+def _paginate_rows(rows: list[dict], max_per_slide: int = _MAX_ROWS_PER_SLIDE,
+                   ) -> list[list[dict]]:
+    """
+    Split rows into pages, keeping product-group boundaries intact where
+    possible.  If a single product group exceeds max_per_slide, it is
+    allowed to overflow onto its own page(s).
+    """
+    if not rows:
+        return [[]]
 
-    title         = spec.get("title", "Product Group")
-    headline      = spec.get("headline", "")
-    cw_columns: list[int] = spec.get("cw_columns", [])
-    quarter_label = spec.get("quarter_label", "Q?")
-    rows: list[dict] = spec.get("rows", [])
+    groups = _compute_product_group_ranges(rows)
+    pages: list[list[dict]] = []
+    current_page: list[dict] = []
 
-    # ── Header ────────────────────────────────────────────────────────
-    _rect(slide, 0, 0, _W, _HH, _C["NAVY"])
-    _tb(slide, _M, Inches(0.06), Inches(11.5), Inches(0.30),
-        title, size=14, bold=True, color=_C["WHITE"])
-    _tb(slide, _M, Inches(0.36), Inches(11.5), Inches(0.22),
-        headline, size=8, color=_C["LIGHT_BLUE"])
+    for start, end, _label in groups:
+        group_rows = rows[start: end + 1]
+        group_size = len(group_rows)
+
+        if len(current_page) + group_size <= max_per_slide:
+            current_page.extend(group_rows)
+        else:
+            # Current page is non-empty and group won't fit — flush
+            if current_page:
+                pages.append(current_page)
+                current_page = []
+
+            # If the group itself is larger than a page, chunk it
+            if group_size > max_per_slide:
+                for chunk_start in range(0, group_size, max_per_slide):
+                    chunk = group_rows[chunk_start: chunk_start + max_per_slide]
+                    pages.append(chunk)
+            else:
+                current_page = list(group_rows)
+
+    if current_page:
+        pages.append(current_page)
+
+    return pages if pages else [[]]
+
+
+def _render_data_slide(prs: Presentation, layout, slide_title: str,
+                       rows: list[dict], cw_columns: list[int],
+                       quarter_label: str, page_num: int = 0,
+                       total_pages: int = 1) -> None:
+    """Render one dashboard table slide matching the corporate template."""
+    slide = _add_slide(prs, layout)
+
+    # ── Title ────────────────────────────────────────────────────────
+    # Try to find an existing title placeholder from the layout first
+    title_set = False
+    for shape in slide.placeholders:
+        if shape.placeholder_format.idx == 0:   # title placeholder
+            shape.text = slide_title
+            title_set = True
+            break
+
+    if not title_set:
+        # Fallback: add a textbox in the same position as the template title
+        tb = slide.shapes.add_textbox(
+            int(_TITLE_LEFT), int(_TITLE_TOP),
+            int(_TITLE_WIDTH), int(_TITLE_HEIGHT),
+        )
+        tb.fill.background()
+        p = tb.text_frame.paragraphs[0]
+        run = p.add_run()
+        run.text = slide_title
+        run.font.name = FONT
+        run.font.size = Pt(16)
+        run.font.bold = True
+        run.font.color.rgb = _C["HDR_BLUE"]
 
     if not rows:
-        _tb(slide, _M, Inches(1.2), Inches(12.0), Inches(0.4),
-            "No data rows for this product group.", size=11, color=_C["BLACK"])
         return
 
-    # ── Table geometry ────────────────────────────────────────────────
-    # Fixed columns:  Component | Plant | Customer | Supplier | Action | FM | Risk
-    FIXED_LABELS  = ["Component",  "Plant",      "Customer",   "Supplier",
-                     "Action / Comment",          "FM",         "Risk"]
-    FIXED_WIDTHS  = [Inches(1.70), Inches(0.62), Inches(1.12), Inches(0.92),
-                     Inches(1.80),               Inches(0.44), Inches(0.53)]
+    # ── Table geometry ───────────────────────────────────────────────
+    n_data_rows = len(rows)
+    n_total_rows = n_data_rows + 2   # 2 header rows
 
-    CW_W = Inches(0.365)
-    Q_W  = Inches(0.53)
+    # Compute available height for table
+    tbl_available_h = _H - _TBL_TOP - Inches(0.15)   # small bottom margin
+    data_row_h = int((tbl_available_h - _HDR_ROW_H - _HDR_SUB_H) / max(n_data_rows, 1))
+    # Clamp row height to reasonable range
+    data_row_h = max(data_row_h, Emu(80000))    # min ~0.088 in
+    data_row_h = min(data_row_h, Emu(280000))   # max ~0.306 in
 
-    n_cw = len(cw_columns)
-    total_fixed = sum(FIXED_WIDTHS)
-    total_cw    = n_cw * CW_W + Q_W
-    available   = _W - 2 * _M
-
-    # Scale CW columns proportionally if they don't fit
-    if total_fixed + total_cw > available:
-        scale = (available - total_fixed) / total_cw
-        CW_W = int(CW_W * scale)
-        Q_W  = int(Q_W  * scale)
-
-    all_widths = FIXED_WIDTHS + [CW_W] * n_cw + [Q_W]
-    n_cols     = len(all_widths)
-    n_rows_tbl = len(rows) + 1  # +1 for header
-
-    tbl_y  = _HH + Inches(0.1)
-    tbl_h  = _H - tbl_y - Inches(0.28)   # space for legend
-    row_h  = max(int(tbl_h / n_rows_tbl), int(Inches(0.31)))
+    tbl_h = _HDR_ROW_H + _HDR_SUB_H + data_row_h * n_data_rows
+    tbl_w = sum(_COL_WIDTHS_EMU)
 
     tbl_shape = slide.shapes.add_table(
-        n_rows_tbl, n_cols,
-        int(_M), int(tbl_y),
-        sum(int(w) for w in all_widths),
-        row_h * n_rows_tbl,
+        n_total_rows, _N_COLS,
+        int(_TBL_LEFT), int(_TBL_TOP),
+        int(tbl_w), int(tbl_h),
     )
     tbl = tbl_shape.table
 
-    # Apply column widths and row heights
-    for i, w in enumerate(all_widths):
-        tbl.columns[i].width = int(w)
-    for r in range(n_rows_tbl):
-        tbl.rows[r].height = row_h
+    # Disable banding (we handle our own colours)
+    tblPr = tbl._tbl.tblPr
+    tblPr.set("bandRow", "0")
+    tblPr.set("bandCol", "0")
+    tblPr.set("firstRow", "0")
+    tblPr.set("lastRow", "0")
 
-    # ── Header row ────────────────────────────────────────────────────
-    hdr_labels = FIXED_LABELS + [f"CW{c}" for c in cw_columns] + [quarter_label]
+    # Apply column widths
+    for ci, w in enumerate(_COL_WIDTHS_EMU):
+        tbl.columns[ci].width = w
+
+    # Apply row heights
+    tbl.rows[0].height = int(_HDR_ROW_H)
+    tbl.rows[1].height = int(_HDR_SUB_H)
+    for ri in range(2, n_total_rows):
+        tbl.rows[ri].height = data_row_h
+
+    # ── Define header labels ────────────────────────────────────────
+    hdr_labels = [
+        "Product\nGroup\n(PG)",
+        "Plant",
+        "Customer/ \nChannel (PG)",
+        "KB Coverage\n to Customer\n(CW/YY)",
+    ]
+    hdr_right_labels = ["Supplier", "Comment", "FM Detail Letter"]
+
+    # ── Perform ALL merges BEFORE writing any content ──────────────
+    #    python-pptx merge() concatenates text from all cells in the
+    #    range, so merging must happen while cells are still empty.
+
+    # Header text columns: merge row 0 + row 1 (vertical)
+    for ci in list(range(_N_FIXED_LEFT)) + list(range(_Q_COL + 1, _N_COLS)):
+        _merge_cells(tbl, 0, ci, 1, ci)
+
+    # CW super-header: merge row 0 cols 4–10 (horizontal)
+    _merge_cells(tbl, 0, _CW_COL_START, 0, _Q_COL)
+
+    # Product-group column: merge data rows that share the same group
+    pg_ranges = _compute_product_group_ranges(rows)
+    for start, end, _label in pg_ranges:
+        if end > start:
+            _merge_cells(tbl, start + 2, 0, end + 2, 0)   # +2 for header rows
+
+    # ── Now write header content ─────────────────────────────────────
+    # Left text columns (merged across rows 0–1)
     for ci, label in enumerate(hdr_labels):
         cell = tbl.cell(0, ci)
-        _cell_fill(cell, _C["NAVY"])
-        is_cw_col = ci >= len(FIXED_LABELS)
-        _cell_write(cell, label, size=7, bold=True, color=_C["WHITE"],
-                    align=PP_ALIGN.CENTER if is_cw_col else PP_ALIGN.LEFT)
+        _cell_fill(cell, _C["HDR_BLUE"])
+        _cell_write_multiline(cell, label, size=7, bold=False, color=_C["WHITE"])
 
-    # ── Data rows ─────────────────────────────────────────────────────
-    for ri, row in enumerate(rows, start=1):
-        alt = _C["LIGHT_GREY"] if ri % 2 == 0 else _C["WHITE"]
+    # CW super-header band (merged across cols 4–10 in row 0) — green bg, no text
+    cell_cw_hdr = tbl.cell(0, _CW_COL_START)
+    _cell_fill(cell_cw_hdr, _C["HDR_GREEN"])
 
-        # Fixed text columns
-        fixed_vals = [
-            row.get("component", ""),
-            row.get("plant", ""),
-            row.get("customer", ""),
-            row.get("supplier", ""),
-            row.get("action", ""),
-            row.get("fm_status", ""),
-        ]
-        for ci, val in enumerate(fixed_vals):
-            cell = tbl.cell(ri, ci)
-            _cell_fill(cell, alt)
-            center = ci in (1, 5)   # Plant and FM columns → center
-            _cell_write(cell, str(val) if val else "", size=7,
-                        align=PP_ALIGN.CENTER if center else PP_ALIGN.LEFT,
-                        color=_C["BLACK"])
+    # Right text columns (merged across rows 0–1)
+    for i, label in enumerate(hdr_right_labels):
+        ci = _Q_COL + 1 + i
+        cell = tbl.cell(0, ci)
+        _cell_fill(cell, _C["HDR_BLUE"])
+        _cell_write_multiline(cell, label, size=7, bold=False, color=_C["WHITE"])
 
-        # Risk level badge (column index 6)
-        risk = str(row.get("risk_level", "")).upper()
-        rc = tbl.cell(ri, 6)
-        _cell_fill(rc, _RISK_BG.get(risk, alt))
-        _cell_write(rc, risk[:4], size=7, bold=True,
-                    color=_RISK_FG.get(risk, _C["BLACK"]),
-                    align=PP_ALIGN.CENTER)
+    # CW number cells (row 1, cols 4–9) — green bg, white bold number
+    for i, cw_num in enumerate(cw_columns):
+        ci = _CW_COL_START + i
+        cell = tbl.cell(1, ci)
+        _cell_fill(cell, _C["HDR_GREEN"])
+        _cell_write(cell, str(cw_num), size=7, bold=True,
+                    color=_C["WHITE"], align=PP_ALIGN.CENTER)
 
-        # CW colored cells
+    # Quarter label cell (row 1, col 10)
+    q_cell = tbl.cell(1, _Q_COL)
+    _cell_fill(q_cell, _C["HDR_GREEN"])
+    _cell_write(q_cell, quarter_label, size=7, bold=True,
+                color=_C["WHITE"], align=PP_ALIGN.CENTER)
+
+    # ── Data rows ────────────────────────────────────────────────────
+    for ri_data, row in enumerate(rows):
+        ri = ri_data + 2   # offset for 2 header rows
+
+        # Plant (may contain newlines e.g. "ALD\nBX")
+        _cell_write_multiline(tbl.cell(ri, 1), row.get("plant", ""), size=6)
+
+        # Customer / Channel
+        _cell_write(tbl.cell(ri, 2), row.get("customer", ""), size=6)
+
+        # KB Coverage (multi-line)
+        _cell_write_multiline(tbl.cell(ri, 3), row.get("kb_coverage", ""), size=6)
+
+        # CW coloured cells
         cw_colors: dict = row.get("cw_colors", {})
-        for cw_i, cw_num in enumerate(cw_columns):
-            ci = len(FIXED_LABELS) + cw_i
+        for i, cw_num in enumerate(cw_columns):
+            ci = _CW_COL_START + i
             rag = str(cw_colors.get(str(cw_num), "GREY")).upper()
             cell = tbl.cell(ri, ci)
-            _cell_fill(cell, _C.get(rag, _C["GREY"]))
-            _cell_write(cell, "", size=5)   # empty — color carries the meaning
+            _cell_fill(cell, _RAG_BG.get(rag, _C["GREY"]))
+            _cell_write(cell, "", size=5)   # empty — colour carries the meaning
 
         # Quarter column
-        q_ci  = len(FIXED_LABELS) + n_cw
         q_rag = str(row.get("quarter_color", "GREY")).upper()
-        q_cell = tbl.cell(ri, q_ci)
-        _cell_fill(q_cell, _C.get(q_rag, _C["GREY"]))
+        q_cell = tbl.cell(ri, _Q_COL)
+        _cell_fill(q_cell, _RAG_BG.get(q_rag, _C["GREY"]))
         _cell_write(q_cell, "", size=5)
 
-    # ── Color legend ──────────────────────────────────────────────────
-    legend_y = tbl_y + row_h * n_rows_tbl + Inches(0.07)
-    if legend_y + Inches(0.2) <= _H:
-        lx = _M
-        for label, color in [
-            ("■ Covered (w/o mitigation)", _C["GREEN"]),
-            ("■ Covered w/ mitigation",    _C["AMBER"]),
-            ("■ Uncovered",                _C["RED"]),
-            ("■ Data unavailable",         _C["GREY"]),
-        ]:
-            _tb(slide, lx, legend_y, Inches(2.85), Inches(0.2),
-                label, size=6, color=color)
-            lx += Inches(2.9)
+        # Supplier
+        _cell_write(tbl.cell(ri, 11), row.get("supplier", ""), size=6)
+
+        # Comment
+        _cell_write(tbl.cell(ri, 12), row.get("comment", ""), size=6)
+
+        # FM Detail Letter
+        _cell_write(tbl.cell(ri, 13), row.get("fm_detail", ""), size=6)
+
+    # ── Product-group merged cell: write label + amber fill ──────────
+    #    After merge, tbl.cell(first_row, 0) refers to the merged cell.
+    for start, _end, label in pg_ranges:
+        cell_pg = tbl.cell(start + 2, 0)       # +2 for header rows
+        _cell_fill(cell_pg, _C["AMBER"])
+        _cell_write_multiline(cell_pg, label, size=6, bold=True)
 
 
-def render_pptx_from_spec(slide_spec: dict, output_path: str | None = None) -> io.BytesIO:
+def render_pptx_from_spec(slide_spec: dict,
+                          output_path: str | None = None,
+                          template_path: str | Path | None = None,
+                          ) -> io.BytesIO:
     """
     Stage 2 (deterministic renderer): Convert an LLM-generated slide spec dict
-    into a python-pptx Presentation.
+    into a python-pptx Presentation matching the corporate GFD template.
 
     Parameters
     ----------
-    slide_spec  : dict produced by llm_generate_slide_spec (or the fallback)
-    output_path : optional path to save the file to disk
+    slide_spec    : dict produced by llm_generate_slide_spec (or the fallback)
+    output_path   : optional path to save the file to disk
+    template_path : optional path to the corporate template PPTX
 
     Returns
     -------
     io.BytesIO buffer (seeked to 0) containing the .pptx bytes
     """
-    prs = Presentation()
-    prs.slide_width  = _W
-    prs.slide_height = _H
+    prs, layout = _load_base_presentation(template_path)
 
-    for slide_def in slide_spec.get("slides", []):
-        stype = slide_def.get("type", "")
-        if stype == "overview":
-            _render_overview(prs, slide_def)
-        elif stype == "product_group":
-            _render_product_group(prs, slide_def)
-        # Silently skip unknown types
+    title         = slide_spec.get("presentation_title", "Global Fulfilment Dashboard")
+    cw_columns    = slide_spec.get("cw_columns", [])
+    quarter_label = slide_spec.get("quarter_label", "Q?")
+    all_rows      = slide_spec.get("rows", [])
+
+    # Paginate rows across slides
+    pages = _paginate_rows(all_rows)
+    total_pages = len(pages)
+
+    for page_idx, page_rows in enumerate(pages):
+        slide_title = title
+        if total_pages > 1:
+            slide_title = f"{title}  ({page_idx + 1}/{total_pages})"
+
+        _render_data_slide(
+            prs, layout,
+            slide_title=slide_title,
+            rows=page_rows,
+            cw_columns=cw_columns,
+            quarter_label=quarter_label,
+            page_num=page_idx,
+            total_pages=total_pages,
+        )
+
+    # Update spec with computed slide count for callers
+    slide_spec["slide_count"] = total_pages
 
     buf = io.BytesIO()
     prs.save(buf)
@@ -734,7 +894,7 @@ def render_pptx_from_spec(slide_spec: dict, output_path: str | None = None) -> i
     return buf
 
 
-# ─── Combined entry point ─────────────────────────────────────────────
+# ─── Combined entry point ───────────────────────────────────────────
 
 async def generate_gfd_dashboard(
     extracted_data: dict,
