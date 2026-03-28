@@ -28,7 +28,7 @@ from __future__ import annotations
 import re
 import json
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -337,20 +337,12 @@ def _compact_customer_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
     return new_df, True
 
 
-# ─── Date-based staleness filtering ──────────────────────────────────
+# ─── Date-based recency filtering ────────────────────────────────────
 
 # Substrings that identify the "Last updated" column (lower-cased).
 _DATE_COL_HINTS = [
     "last update", "last änderung", "last change", "aktualisiert",
     "updated", "update date", "datum", "date",
-]
-
-# Date format strings tried in order when the cell value is a string.
-_DATE_FORMATS = [
-    "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y",
-    "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d-%m-%Y",
-    "%d %b %Y", "%d %B %Y", "%b %d, %Y", "%B %d, %Y",
-    "%d.%m", "%d/%m",
 ]
 
 
@@ -363,102 +355,61 @@ def _find_date_column(columns: list[str]) -> str | None:
     return None
 
 
-def _parse_date_value(raw: Any) -> date | None:
-    """
-    Convert a raw cell value to a Python date.
-
-    Handles: datetime/date objects, pandas Timestamps, Excel serial
-    numbers (float/int), and string values in common European/US formats.
-    Returns None when unparseable.
-    """
-    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
-        return None
-    if isinstance(raw, pd.Timestamp):
-        return raw.date()
-    if isinstance(raw, datetime):
-        return raw.date()
-    if isinstance(raw, date):
-        return raw
-
-    # Excel serial date (float/int left un-converted by the engine)
-    if isinstance(raw, (int, float)):
-        try:
-            base = date(1899, 12, 30)
-            return base + timedelta(days=int(raw))
-        except (ValueError, OverflowError):
-            return None
-
-    # String → try known formats
-    s = str(raw).strip()
-    if not s:
-        return None
-    s = re.sub(r"^[A-Za-z]{2,3}[,.\s]+", "", s).strip()   # "Mon, " prefix
-    current_year = datetime.now().year
-
-    for fmt in _DATE_FORMATS:
-        try:
-            dt = datetime.strptime(s, fmt)
-            if "%Y" not in fmt and "%y" not in fmt:
-                dt = dt.replace(year=current_year)
-            return dt.date()
-        except ValueError:
-            continue
-    return None
-
-
-def _get_recent_month_window() -> tuple[date, date, str]:
-    """
-    Compute the date window for "current month + previous month".
-
-    Returns (window_start, window_end, description) where:
-      window_start = 1st day of the previous month
-      window_end   = last day of the current month
-    """
-    today = date.today()
-    # First day of current month
-    first_of_current = today.replace(day=1)
-    # First day of previous month
-    if today.month == 1:
-        first_of_previous = date(today.year - 1, 12, 1)
-    else:
-        first_of_previous = date(today.year, today.month - 1, 1)
-    # Last day of current month
-    if today.month == 12:
-        last_of_current = date(today.year, 12, 31)
-    else:
-        last_of_current = date(today.year, today.month + 1, 1) - timedelta(days=1)
-
-    prev_label = first_of_previous.strftime("%b %Y")
-    curr_label = first_of_current.strftime("%b %Y")
-    desc = f"{prev_label} – {curr_label}"
-
-    return first_of_previous, last_of_current, desc
-
-
 def _filter_by_recent_months(
     df: pd.DataFrame,
     date_col: str,
 ) -> tuple[pd.DataFrame, int, str]:
     """
-    Keep only rows whose 'Last update' falls within the current calendar
+    Keep only rows whose date_col falls within the current calendar
     month or the previous calendar month.
 
-    Rows where the date is unparseable are KEPT (benefit of the doubt).
+    Uses a two-pass pd.to_datetime approach:
+      Pass 1: pd.to_datetime(errors='coerce') — handles native datetime
+              objects, Timestamps, ISO strings, and most common formats.
+      Pass 2: for any remaining NaTs, try common European dot-separated
+              formats (dd.mm.yyyy, dd.mm.yy) that pd.to_datetime misses.
+
+    Rows where the date is still NaT after both passes are KEPT
+    (benefit of the doubt — unparseable or missing).
 
     Returns (filtered_df, num_removed, window_description).
     """
-    window_start, window_end, desc = _get_recent_month_window()
+    # ── Two-pass date parsing ────────────────────────────────────────
+    # Pass 1: let pandas auto-detect
+    dates = pd.to_datetime(df[date_col], errors="coerce")
 
-    keep_mask = pd.Series(True, index=df.index)
-    for idx in df.index:
-        raw = df.at[idx, date_col]
-        parsed = _parse_date_value(raw)
-        if parsed is not None:
-            if parsed < window_start or parsed > window_end:
-                keep_mask[idx] = False
+    # Pass 2: for remaining NaTs, try European dot-separated formats
+    still_nat = dates.isna() & df[date_col].notna()
+    if still_nat.any():
+        for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y"):
+            if not still_nat.any():
+                break
+            parsed = pd.to_datetime(
+                df.loc[still_nat, date_col], format=fmt, errors="coerce"
+            )
+            dates[still_nat] = dates[still_nat].fillna(parsed)
+            still_nat = dates.isna() & df[date_col].notna()
+
+    # ── Compute the month window ─────────────────────────────────────
+    today = pd.Timestamp.today().normalize()
+    start_current_month = today.replace(day=1)
+    start_previous_month = start_current_month - pd.offsets.MonthBegin(1)
+    end_current_month = start_current_month + pd.offsets.MonthEnd(1)
+
+    prev_label = start_previous_month.strftime("%b %Y")
+    curr_label = start_current_month.strftime("%b %Y")
+    desc = f"{prev_label} – {curr_label}"
+
+    # ── Apply filter ─────────────────────────────────────────────────
+    # Keep rows where date is within window OR date is NaT (unparseable)
+    in_window = (dates >= start_previous_month) & (dates < end_current_month)
+    is_nat = dates.isna()
+    keep_mask = in_window | is_nat
 
     filtered = df[keep_mask]
-    return filtered, int((~keep_mask).sum()), desc
+    num_removed = int((~keep_mask).sum())
+
+    return filtered, num_removed, desc
 
 
 # ─── Text table builder ─────────────────────────────────────────────
@@ -525,6 +476,7 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
       date_col_name       : header of the detected date column, or None
       customer_col_range  : None (legacy field, kept for compatibility)
       csv_path            : path to the extracted CSV (before filtering), or None
+      filtered_csv_path   : path to the filtered CSV (after filtering), or None
       warnings            : list of warning strings
     }
     """
@@ -601,6 +553,17 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
             "current or previous month."
         )
 
+    # ── Save filtered rows to a second CSV ───────────────────────────
+    filtered_csv_path = str(Path(filepath).with_name(
+        Path(filepath).stem + "_filtered.csv"
+    ))
+    try:
+        df.to_csv(filtered_csv_path, index=False)
+        warnings.append(f"Filtered CSV saved: {filtered_csv_path} ({kept_rows} rows)")
+    except Exception as fcsv_exc:
+        warnings.append(f"Could not save filtered CSV: {fcsv_exc}")
+        filtered_csv_path = None
+
     # ── Build pipe-delimited text table ──────────────────────────────
     headers = list(df.columns)
     rows: list[list[str]] = []
@@ -620,6 +583,7 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
         "date_col_name":      date_col_name,
         "customer_col_range": None,    # legacy field kept for Stage 2 compat
         "csv_path":           csv_path,
+        "filtered_csv_path":  filtered_csv_path,
         "warnings":           warnings,
     }
 
@@ -786,6 +750,7 @@ async def llm_extract_gfd_data(
             "date_col_name": stage1.get("date_col_name"),
             "customer_col_range": stage1.get("customer_col_range"),
             "csv_path": stage1.get("csv_path"),
+            "filtered_csv_path": stage1.get("filtered_csv_path"),
         }
         return extracted
 
@@ -821,6 +786,7 @@ def _extraction_fallback(stage1: dict, error_msg: str) -> dict:
             "date_col_name": stage1.get("date_col_name"),
             "customer_col_range": stage1.get("customer_col_range"),
             "csv_path": stage1.get("csv_path"),
+            "filtered_csv_path": stage1.get("filtered_csv_path"),
         },
     }
 
