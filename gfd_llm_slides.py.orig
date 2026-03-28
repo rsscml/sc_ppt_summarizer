@@ -59,7 +59,7 @@ TEMPLATE_PATH = Path(__file__).parent / "gfd_ppt_template.pptx"
 
 # ─── LLM factory ────────────────────────────────────────────────────
 
-def _create_llm(config: dict, max_tokens: int = 8192) -> AzureChatOpenAI:
+def _create_llm(config: dict, max_tokens: int = 64000) -> AzureChatOpenAI:
     return AzureChatOpenAI(
         azure_deployment=config["azure_deployment"],
         azure_endpoint=config["azure_endpoint"],
@@ -308,17 +308,16 @@ COLUMNS (in order):
   product_group  — "Name\\n(code)" format, e.g. "Compressors\\n(11)".
                    Every row in the same group must have the IDENTICAL value.
   plant          — Plant location code, ≤ 15 chars
-  customer       — Customer or channel name, ≤ 120 chars.  May be empty.
+  customer       — Customer or channel name, ≤ 40 chars.  May be empty.
   kb_coverage    — KB coverage to customer as compact text (e.g. "CW17/18\\nCW21").
                    Combine coverage-without and coverage-with values on separate lines.
                    If only one value, use a single line.  Use "CWnn" format.
   cw_colors      — Object mapping each of the 6 CW column numbers (as strings)
                    to a RAG colour: "GREEN", "AMBER", "RED", or "GREY".
   quarter_color  — Single RAG colour for the quarter column.
-  supplier       — Supplier name or description, ≤ 120 chars
-  comment        — Action / comment text.  Preserve the FULL text — do NOT
-                   truncate or summarise.  Include every detail from the source.
-  fm_detail      — Force Majeure detail letter status, ≤ 60 chars
+  supplier       — Supplier name or description, ≤ 60 chars
+  comment        — Action / comment text, ≤ 90 chars
+  fm_detail      — Force Majeure detail letter status, ≤ 30 chars
 
 CW COLUMNS:
   Exactly 6 consecutive calendar-week integers starting from the current CW.
@@ -374,7 +373,7 @@ CRITICAL JSON RULES:
       "cw_colors": {{"13":"GREEN","14":"GREEN","15":"GREEN","16":"GREEN","17":"GREEN","18":"RED"}},
       "quarter_color": "RED",
       "supplier": "Supplier Corp.",
-      "comment": "Dual source activation by CW14; emergency air freight bridge 3 weeks; weekly escalation calls with supplier VP Ops",
+      "comment": "Dual source activation by CW14",
       "fm_detail": "sent"
     }},
     {{
@@ -422,7 +421,7 @@ async def llm_generate_slide_spec(
 
     Returns a dict with a "rows" list.  Falls back to a deterministic spec on error.
     """
-    llm = _create_llm(llm_config, max_tokens=8192)
+    llm = _create_llm(llm_config, max_tokens=64000)
     t0 = time.time()
     today = date.today().isoformat()
     current_cw = extracted.get("current_cw", "CW??/????")
@@ -577,13 +576,13 @@ def _deterministic_fallback_spec(extracted: dict) -> dict:
             all_rows.append({
                 "product_group":  pg_label,
                 "plant":          (row.get("plant_location") or "")[:15],
-                "customer":       (row.get("customer_affected") or "")[:120],
+                "customer":       (row.get("customer_affected") or "")[:40],
                 "kb_coverage":    kb_coverage,
                 "cw_colors":      cw_colors,
                 "quarter_color":  quarter_color,
-                "supplier":       (row.get("supplier_text") or "")[:120],
-                "comment":        (row.get("action_comment") or ""),
-                "fm_detail":      str(row.get("customer_informed") or "")[:60],
+                "supplier":       (row.get("supplier_text") or "")[:60],
+                "comment":        (row.get("action_comment") or "")[:90],
+                "fm_detail":      str(row.get("customer_informed") or "")[:30],
             })
 
     total = len(all_rows)
