@@ -62,19 +62,16 @@
   .btn-full { width: 100%; }
   .btn-download { background: var(--green); color: #fff; }
   .btn-download:hover { background: #1e5639; }
+  .btn-outline { background: transparent; color: var(--accent); border: 1.5px solid var(--accent); }
+  .btn-outline:hover { background: var(--accent-light); }
+  .btn-sm { padding: 6px 12px; font-size: 12px; }
 
   /* ── Product group pills ──────────── */
   .pg-list { display: flex; flex-direction: column; gap: 6px; }
   .pg-pill { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 10px 12px; border-radius: 8px; background: var(--surface-2); }
   .pg-pill .pg-info { flex: 1; }
   .pg-pill .pg-name { font-size: 13px; font-weight: 600; color: var(--text-2); line-height: 1.3; }
-  .pg-pill .pg-headline { font-size: 11px; color: var(--text-dim); margin-top: 2px; line-height: 1.4; }
   .pg-pill .pg-count { font-family: var(--mono); font-size: 11px; color: var(--text-muted); background: var(--white); padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); white-space: nowrap; flex-shrink: 0; }
-  .pg-pill .risk-badge { font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 4px; color: #fff; text-transform: uppercase; letter-spacing: 0.04em; flex-shrink: 0; }
-  .risk-CRITICAL { background: #c53030; }
-  .risk-HIGH { background: #dd6b20; }
-  .risk-MEDIUM { background: #d69e2e; }
-  .risk-LOW { background: #38a169; }
 
   /* ── Session & warning cards ──────── */
   .session-card { background: var(--surface-2); border-radius: 8px; padding: 12px; font-size: 12px; color: var(--text-dim); font-family: var(--mono); line-height: 1.8; }
@@ -89,6 +86,7 @@
   .status-pill { font-size: 11px; font-weight: 600; padding: 4px 12px; border-radius: 20px; letter-spacing: 0.02em; }
   .status-pill.idle { background: var(--surface-2); color: var(--text-muted); }
   .status-pill.processing { background: var(--accent-light); color: var(--accent); }
+  .status-pill.extracted { background: var(--amber-bg); color: var(--amber); }
   .status-pill.ready { background: var(--green-bg); color: var(--green); }
 
   /* ── Progress ────────────────────── */
@@ -110,21 +108,47 @@
   .step-num { width: 28px; height: 28px; border-radius: 50%; background: var(--accent-light); color: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0; font-family: var(--mono); }
   .step-text { font-size: 13.5px; color: var(--text-dim); padding-top: 4px; line-height: 1.5; }
 
-  /* ── Overview card ────────────────── */
-  .overview-card { background: var(--white); border: 1px solid var(--border); border-radius: 12px; padding: 28px 32px; margin-bottom: 24px; }
-  .overview-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
-  .overview-title { font-family: var(--serif); font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: var(--text); }
-  .overall-badge { font-size: 12px; font-weight: 700; padding: 6px 16px; border-radius: 8px; color: #fff; letter-spacing: 0.03em; }
-  .overview-bullets { list-style: none; }
-  .overview-bullets li { padding: 8px 0; border-top: 1px solid var(--surface-3); font-size: 14px; color: var(--text-2); line-height: 1.6; display: flex; align-items: flex-start; gap: 10px; }
-  .overview-bullets li:first-child { border-top: none; }
-  .bullet-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; margin-top: 7px; }
+  /* ── Review panel ──────────────────── */
+  .review-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  .review-title { font-family: var(--serif); font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
+  .review-meta { font-size: 12px; color: var(--text-dim); font-family: var(--mono); }
+  .extraction-note { background: var(--accent-light); border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; color: var(--accent); line-height: 1.5; }
 
-  /* ── Download section ─────────────── */
-  .download-section { background: var(--white); border: 1px solid var(--border); border-radius: 12px; padding: 24px 32px; display: flex; align-items: center; justify-content: space-between; }
-  .dl-info { }
-  .dl-info h3 { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
-  .dl-info p { font-size: 13px; color: var(--text-dim); }
+  .pg-review { background: var(--white); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 16px; overflow: hidden; }
+  .pg-review-header {
+    padding: 14px 18px; cursor: pointer; display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid transparent; transition: all 0.15s; user-select: none;
+  }
+  .pg-review-header:hover { background: var(--surface-2); }
+  .pg-review.open .pg-review-header { border-bottom-color: var(--border); background: var(--surface-2); }
+  .pg-review-name { font-size: 14px; font-weight: 600; color: var(--text); }
+  .pg-review-name .code { font-family: var(--mono); font-weight: 500; color: var(--text-dim); margin-left: 6px; font-size: 12px; }
+  .pg-review-right { display: flex; align-items: center; gap: 10px; }
+  .pg-review-count { font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
+  .pg-chevron { font-size: 14px; color: var(--text-muted); transition: transform 0.2s; }
+  .pg-review.open .pg-chevron { transform: rotate(90deg); }
+  .pg-review-body { display: none; padding: 0; }
+  .pg-review.open .pg-review-body { display: block; }
+
+  .row-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .row-table th { text-align: left; padding: 8px 12px; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); background: var(--surface-2); border-bottom: 1px solid var(--border); position: sticky; top: 0; }
+  .row-table td { padding: 8px 12px; border-bottom: 1px solid var(--surface-3); color: var(--text-2); vertical-align: top; line-height: 1.5; }
+  .row-table tr:last-child td { border-bottom: none; }
+  .row-table tr:hover td { background: var(--surface-2); }
+  .cell-mono { font-family: var(--mono); font-size: 11px; }
+  .cw-val { display: inline-block; padding: 1px 5px; border-radius: 3px; font-family: var(--mono); font-size: 10px; }
+  .cw-null { color: var(--text-muted); }
+
+  /* ── Generate + download section ───── */
+  .generate-section { background: var(--white); border: 1px solid var(--border); border-radius: 12px; padding: 24px 28px; margin-top: 20px; }
+  .generate-section h3 { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+  .generate-section p { font-size: 13px; color: var(--text-dim); margin-bottom: 16px; }
+  .generate-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  .download-section { background: var(--white); border: 1px solid var(--border); border-radius: 12px; padding: 24px 28px; margin-top: 16px; }
+  .download-section h3 { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+  .download-section p { font-size: 13px; color: var(--text-dim); margin-bottom: 16px; }
+  .download-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 
   /* ── Toast ───────────────────────── */
   .toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 22px; border-radius: 10px; font-size: 13px; font-weight: 500; background: var(--white); border: 1px solid var(--border); color: var(--text); z-index: 1000; box-shadow: 0 4px 24px rgba(0,0,0,0.08); transform: translateY(80px); opacity: 0; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
@@ -173,8 +197,8 @@
         </select>
       </div>
       <div style="margin-top:12px">
-        <button class="btn btn-primary btn-full" id="btnUpload" onclick="uploadAndGenerate()" disabled>
-          Upload &amp; Generate Dashboard
+        <button class="btn btn-primary btn-full" id="btnUpload" onclick="uploadAndExtract()" disabled>
+          Upload &amp; Extract
         </button>
       </div>
     </div>
@@ -218,26 +242,27 @@
           <div class="steps">
             <div class="step">
               <div class="step-num">1</div>
-              <div class="step-text">Upload your .xlsx file containing the Dashboard_Update worksheet</div>
+              <div class="step-text">Upload your .xlsx file — the LLM extracts and structures all product groups and risk rows</div>
             </div>
             <div class="step">
               <div class="step-num">2</div>
-              <div class="step-text">The LLM interprets and condenses each product group's risk data</div>
+              <div class="step-text">Review the extracted data — check product groups, coverage weeks, suppliers, and actions</div>
             </div>
             <div class="step">
               <div class="step-num">3</div>
-              <div class="step-text">Download the generated .pptx with overview slide + CW heatmap tables</div>
+              <div class="step-text">Generate and download the CW heatmap dashboard as .pptx or .docx</div>
             </div>
           </div>
         </div>
       </div>
 
-      <div id="resultArea" style="display:none">
-        <div class="overview-card" id="overviewCard"></div>
-        <div class="download-section" id="downloadSection"></div>
-      </div>
-    </div>
+      <!-- Review area (shown after extraction) -->
+      <div id="reviewArea" style="display:none"></div>
 
+      <!-- Download area (shown after generation) -->
+      <div id="downloadArea" style="display:none"></div>
+
+    </div>
   </div>
 </div>
 
@@ -246,6 +271,7 @@
 <script>
   let gfdSessionId = null;
   let selectedFile = null;
+  let extractedData = null;
 
   function toast(msg, type = '') {
     const t = document.getElementById('toast');
@@ -265,8 +291,9 @@
     document.getElementById('progressFill').style.width = pct + '%';
     document.getElementById('progressLabel').textContent = label;
   }
-
   function hideProgress() { document.getElementById('progressBar').classList.remove('visible'); }
+
+  function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
 
   // ── File handling ──
   function handleFile(input) {
@@ -291,17 +318,18 @@
     }
   });
 
-  // ── Upload & Generate ──
-  async function uploadAndGenerate() {
+  // ── Step 1: Upload & Extract ──
+  async function uploadAndExtract() {
     if (!selectedFile) return;
     const btn = document.getElementById('btnUpload');
     btn.disabled = true;
-    btn.textContent = 'Processing...';
-    setStatus('Processing', 'processing');
+    btn.textContent = 'Extracting...';
+    setStatus('Extracting', 'processing');
     showProgress(10, 'Uploading Excel file...');
 
     document.getElementById('welcomeScreen').style.display = 'none';
-    document.getElementById('resultArea').style.display = 'none';
+    document.getElementById('reviewArea').style.display = 'none';
+    document.getElementById('downloadArea').style.display = 'none';
 
     const fd = new FormData();
     fd.append('file', selectedFile);
@@ -310,96 +338,39 @@
     let pct = 10;
     const iv = setInterval(() => {
       if (pct < 85) {
-        pct += 3;
+        pct += 4;
         const labels = [
           'Parsing Dashboard_Update worksheet...',
-          'Detecting headers and columns...',
-          'Interpreting product groups with LLM...',
-          'Condensing actions and root causes...',
-          'Generating executive overview...',
-          'Building CW heatmap slides...',
+          'Detecting headers and resolving merged cells...',
+          'Filtering stale rows...',
+          'Sending to LLM for extraction...',
+          'Interpreting product groups...',
+          'Structuring coverage data...',
         ];
         const idx = Math.min(Math.floor((pct - 10) / 13), labels.length - 1);
         showProgress(pct, labels[idx]);
       }
-    }, 1800);
+    }, 1400);
 
     try {
       const res = await fetch('/api/gfd/upload', { method: 'POST', body: fd });
       clearInterval(iv);
       if (!res.ok) {
         const err = await res.json();
-        throw new Error(err.detail || 'Processing failed');
+        throw new Error(err.detail || 'Extraction failed');
       }
       const data = await res.json();
       gfdSessionId = data.session_id;
+      extractedData = data;
 
-      showProgress(100, 'Done');
-      setStatus('Ready', 'ready');
+      showProgress(100, 'Extraction complete');
+      setStatus('Review', 'extracted');
 
-      // ── Sidebar: Product Groups ──
-      const pgList = document.getElementById('pgList');
-      pgList.innerHTML = '';
-      (data.product_groups || []).forEach(pg => {
-        const riskClass = pg.headline && pg.headline.match(/CRITICAL|HIGH|MEDIUM|LOW/)
-          ? pg.headline.match(/CRITICAL|HIGH|MEDIUM|LOW/)[0] : '';
-        pgList.innerHTML += `<div class="pg-pill">
-          <div class="pg-info">
-            <div class="pg-name">${pg.product_family}${pg.code ? ' (' + pg.code + ')' : ''}</div>
-            ${pg.headline ? '<div class="pg-headline">' + pg.headline + '</div>' : ''}
-          </div>
-          <span class="pg-count">${pg.risk_items} risk${pg.risk_items !== 1 ? 's' : ''}</span>
-        </div>`;
-      });
-      document.getElementById('pgPanel').style.display = 'block';
+      renderSidebar(data);
+      renderReview(data);
 
-      // ── Sidebar: Warnings ──
-      if (data.warnings && data.warnings.length) {
-        const wl = document.getElementById('warningsList');
-        wl.innerHTML = data.warnings.map(w => `<div class="warn-item">&#x26A0; ${w}</div>`).join('');
-        document.getElementById('warningsPanel').style.display = 'block';
-      } else {
-        document.getElementById('warningsPanel').style.display = 'none';
-      }
-
-      // ── Sidebar: Session ──
-      document.getElementById('sessionPanel').style.display = 'block';
-      document.getElementById('sessionDetails').innerHTML =
-        `${data.filename}<br>${data.total_rows} risk items · ${(data.product_groups || []).length} product groups`;
-
-      // ── Main: Overview Card ──
-      const overview = data.executive_overview || {};
-      const overviewCard = document.getElementById('overviewCard');
-      const risk = overview.overall_risk || 'HIGH';
-      const badgeClass = 'risk-' + risk;
-      let bulletsHtml = '';
-      (overview.bullets || []).forEach(b => {
-        bulletsHtml += `<li><span class="bullet-dot"></span>${b}</li>`;
-      });
-      overviewCard.innerHTML = `
-        <div class="overview-header">
-          <div class="overview-title">${overview.title || 'Fulfilment Risk Overview'}</div>
-          <span class="overall-badge ${badgeClass}">${risk}</span>
-        </div>
-        <ul class="overview-bullets">${bulletsHtml}</ul>
-      `;
-
-      // ── Main: Download ──
-      const dlSection = document.getElementById('downloadSection');
-      dlSection.innerHTML = `
-        <div class="dl-info">
-          <h3>Dashboard slides ready</h3>
-          <p>Executive overview + CW${getCurrentWeek()} forward-looking heatmap (${data.total_rows} risk items)</p>
-        </div>
-        <button class="btn btn-download" onclick="downloadPptx()">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          Download .pptx
-        </button>
-      `;
-
-      document.getElementById('resultArea').style.display = 'block';
-      toast(`Dashboard generated: ${data.total_rows} risk items across ${(data.product_groups || []).length} product groups`, 'success');
-      setTimeout(hideProgress, 1500);
+      toast(`Extracted ${countRows(data)} risk items across ${(data.product_groups || []).length} product groups — review below`, 'success');
+      setTimeout(hideProgress, 1200);
 
     } catch (e) {
       clearInterval(iv);
@@ -409,26 +380,226 @@
       document.getElementById('welcomeScreen').style.display = 'flex';
     }
     btn.disabled = false;
-    btn.textContent = 'Upload & Generate Dashboard';
+    btn.textContent = 'Upload & Extract';
   }
 
-  // ── Download ──
-  function downloadPptx() {
+  function countRows(data) {
+    return (data.product_groups || []).reduce((s, pg) => s + (pg.rows || []).length, 0);
+  }
+
+  // ── Sidebar ──
+  function renderSidebar(data) {
+    const pgList = document.getElementById('pgList');
+    pgList.innerHTML = '';
+    (data.product_groups || []).forEach(pg => {
+      const name = pg.product_family_desc || pg.product_family || 'Unknown';
+      const code = pg.product_family_code || pg.code || '';
+      const count = (pg.rows || []).length || pg.risk_items || 0;
+      pgList.innerHTML += `<div class="pg-pill">
+        <div class="pg-info">
+          <div class="pg-name">${esc(name)}${code ? ' <span style="color:var(--text-muted)">(' + esc(code) + ')</span>' : ''}</div>
+        </div>
+        <span class="pg-count">${count} row${count !== 1 ? 's' : ''}</span>
+      </div>`;
+    });
+    document.getElementById('pgPanel').style.display = 'block';
+
+    if (data.warnings && data.warnings.length) {
+      document.getElementById('warningsList').innerHTML = data.warnings.map(w => `<div class="warn-item">&#x26A0; ${esc(w)}</div>`).join('');
+      document.getElementById('warningsPanel').style.display = 'block';
+    } else {
+      document.getElementById('warningsPanel').style.display = 'none';
+    }
+
+    document.getElementById('sessionPanel').style.display = 'block';
+    document.getElementById('sessionDetails').innerHTML =
+      `${esc(data.filename)}<br>${data.rows_after_filter ?? countRows(data)} rows (of ${data.total_rows_in_file ?? '?'} total)<br>${(data.product_groups || []).length} product groups<br>${esc(data.current_cw || '')}`;
+  }
+
+  // ── Review panel ──
+  function renderReview(data) {
+    const area = document.getElementById('reviewArea');
+    const totalRows = countRows(data);
+    const pgs = data.product_groups || [];
+
+    let html = `
+      <div class="review-header">
+        <div class="review-title">Extracted Data Review</div>
+        <div class="review-meta">${totalRows} rows · ${pgs.length} product groups · ${esc(data.current_cw || '')}</div>
+      </div>`;
+
+    if (data.extraction_notes) {
+      html += `<div class="extraction-note">${esc(data.extraction_notes)}</div>`;
+    }
+
+    pgs.forEach((pg, pgIdx) => {
+      const name = pg.product_family_desc || pg.product_family || 'Unknown';
+      const code = pg.product_family_code || pg.code || '';
+      const rows = pg.rows || [];
+      const isFirst = pgIdx === 0;
+
+      html += `
+      <div class="pg-review${isFirst ? ' open' : ''}" id="pgReview${pgIdx}">
+        <div class="pg-review-header" onclick="togglePg(${pgIdx})">
+          <div class="pg-review-name">${esc(name)}${code ? '<span class="code">' + esc(code) + '</span>' : ''}</div>
+          <div class="pg-review-right">
+            <span class="pg-review-count">${rows.length} row${rows.length !== 1 ? 's' : ''}</span>
+            <span class="pg-chevron">&#x25B6;</span>
+          </div>
+        </div>
+        <div class="pg-review-body">
+          <div style="overflow-x:auto">
+          <table class="row-table">
+            <thead><tr>
+              <th>Plant</th>
+              <th>Customer</th>
+              <th>Component</th>
+              <th>Cov. w/o</th>
+              <th>Cov. w/</th>
+              <th>Supplier</th>
+              <th>Action / Comment</th>
+              <th>FM</th>
+            </tr></thead>
+            <tbody>`;
+
+      rows.forEach(row => {
+        const covWo = row.coverage_without_mitigation_cw;
+        const covW = row.coverage_with_mitigation_cw;
+        html += `<tr>
+          <td class="cell-mono">${esc(row.plant_location || '')}</td>
+          <td>${esc(row.customer_affected || '')}</td>
+          <td>${esc(row.critical_component || '')}</td>
+          <td class="cell-mono">${covWo != null ? '<span class="cw-val">CW' + covWo + '</span>' : '<span class="cw-null">—</span>'}</td>
+          <td class="cell-mono">${covW != null ? '<span class="cw-val">CW' + covW + '</span>' : '<span class="cw-null">—</span>'}</td>
+          <td>${esc(row.supplier_text || '')}</td>
+          <td>${esc(row.action_comment || '')}</td>
+          <td class="cell-mono">${esc(row.customer_informed || '')}</td>
+        </tr>`;
+      });
+
+      html += `</tbody></table></div></div></div>`;
+    });
+
+    html += `
+    <div class="generate-section">
+      <h3>Generate Dashboard</h3>
+      <p>The extracted data above will be used to generate the CW heatmap dashboard. Choose your format:</p>
+      <div class="generate-actions">
+        <button class="btn btn-primary" id="btnGenPptx" onclick="generateDashboard('pptx')">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+          Generate &amp; Download .pptx
+        </button>
+        <button class="btn btn-outline" id="btnGenDocx" onclick="generateDashboard('docx')">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          Generate &amp; Download .docx
+        </button>
+      </div>
+    </div>`;
+
+    area.innerHTML = html;
+    area.style.display = 'block';
+  }
+
+  function togglePg(idx) {
+    document.getElementById('pgReview' + idx).classList.toggle('open');
+  }
+
+  // ── Step 2: Generate dashboard ──
+  async function generateDashboard(format) {
     if (!gfdSessionId) return;
+
+    const btnP = document.getElementById('btnGenPptx');
+    const btnD = document.getElementById('btnGenDocx');
+    btnP.disabled = true;
+    btnD.disabled = true;
+    const activeBtn = format === 'docx' ? btnD : btnP;
+    const origText = activeBtn.textContent;
+    activeBtn.textContent = 'Generating...';
+
+    setStatus('Generating', 'processing');
+    showProgress(20, 'Generating slide specification...');
+
+    let pct = 20;
+    const iv = setInterval(() => {
+      if (pct < 90) {
+        pct += 5;
+        const labels = [
+          'Computing RAG colours for each CW...',
+          'Condensing text for slide display...',
+          'Building executive overview...',
+          'Rendering dashboard...',
+        ];
+        const idx = Math.min(Math.floor((pct - 20) / 18), labels.length - 1);
+        showProgress(pct, labels[idx]);
+      }
+    }, 1500);
+
+    try {
+      const fd = new FormData();
+      fd.append('session_id', gfdSessionId);
+      fd.append('format', format);
+
+      const res = await fetch('/api/gfd/generate', { method: 'POST', body: fd });
+      clearInterval(iv);
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Generation failed');
+      }
+      await res.json();
+
+      showProgress(100, 'Dashboard generated');
+      setStatus('Ready', 'ready');
+
+      // Trigger download
+      triggerDownload(format);
+
+      // Show persistent download section
+      renderDownloadSection();
+
+      toast(`Dashboard generated — downloading .${format}`, 'success');
+      setTimeout(hideProgress, 1200);
+
+    } catch (e) {
+      clearInterval(iv);
+      toast(e.message, 'error');
+      setStatus('Review', 'extracted');
+      hideProgress();
+    }
+
+    btnP.disabled = false;
+    btnD.disabled = false;
+    activeBtn.textContent = origText;
+  }
+
+  function triggerDownload(format) {
+    if (!gfdSessionId) return;
+    const endpoint = format === 'docx' ? '/api/gfd/download/docx' : '/api/gfd/download';
     const a = document.createElement('a');
-    a.href = `/api/gfd/download?session_id=${encodeURIComponent(gfdSessionId)}`;
+    a.href = `${endpoint}?session_id=${encodeURIComponent(gfdSessionId)}`;
     a.download = '';
     document.body.appendChild(a);
     a.click();
     a.remove();
   }
 
-  function getCurrentWeek() {
-    const now = new Date();
-    const start = new Date(now.getFullYear(), 0, 1);
-    const diff = now - start;
-    const oneWeek = 604800000;
-    return Math.ceil((diff / oneWeek) + start.getDay() / 7);
+  function renderDownloadSection() {
+    const area = document.getElementById('downloadArea');
+    area.innerHTML = `
+      <div class="download-section">
+        <h3>Dashboard ready</h3>
+        <p>Download again in either format:</p>
+        <div class="download-actions">
+          <button class="btn btn-download btn-sm" onclick="triggerDownload('pptx')">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            .pptx
+          </button>
+          <button class="btn btn-download btn-sm" onclick="triggerDownload('docx')">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            .docx
+          </button>
+        </div>
+      </div>`;
+    area.style.display = 'block';
   }
 </script>
 </body>

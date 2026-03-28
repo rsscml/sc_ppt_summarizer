@@ -58,13 +58,13 @@ TEMPLATE_PATH = Path(__file__).parent / "gfd_ppt_template.pptx"
 
 # ─── LLM factory ────────────────────────────────────────────────────
 
-def _create_llm(config: dict, max_tokens: int = 64000) -> AzureChatOpenAI:
+def _create_llm(config: dict, max_tokens: int = 8192) -> AzureChatOpenAI:
     return AzureChatOpenAI(
         azure_deployment=config["azure_deployment"],
         azure_endpoint=config["azure_endpoint"],
         api_key=config["api_key"],
         api_version=config.get("api_version", "2024-12-01-preview"),
-        #temperature=0.15,
+        temperature=0.15,
         max_tokens=max_tokens,
     )
 

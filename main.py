@@ -22,6 +22,7 @@ from glossary import load_glossary_dir, load_glossary_file, normalise_json, rend
 from docx_export import markdown_to_docx
 from gfd_llm_parser import parse_gfd_with_llm
 from gfd_llm_slides import generate_gfd_dashboard
+from gfd_docx_export import gfd_spec_to_docx
 from agent import (
     build_summarization_graph,
     refine_summary,
@@ -435,13 +436,12 @@ async def delete_glossary_file(filename: str):
 @app.post("/api/gfd/upload")
 async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(4)):
     """
-    Upload a Dashboard_Update Excel file.
+    Upload a Dashboard_Update Excel file — runs Stages 1 + 2 only.
 
-    Pipeline:
-      Stage 1 — deterministic: Excel → filtered pipe-delimited text table
-      Stage 2 — LLM extraction: text table → structured JSON (product groups, CW integers)
-      Stage 3 — LLM slide spec: extracted JSON → complete slide specification
-      Stage 4 — PPTX renderer: slide spec → .pptx file
+    Stage 1 — deterministic: Excel → filtered pipe-delimited text table
+    Stage 2 — LLM extraction: text table → structured JSON (product groups, CW integers)
+
+    Returns the extracted JSON for user review before slide generation.
     """
     if not file.filename.endswith((".xlsx", ".xls", ".xlsm")):
         raise HTTPException(status_code=400, detail="Please upload an .xlsx file.")
@@ -466,35 +466,75 @@ async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(4))
             detail=f"Excel parsing / LLM extraction failed: {str(e)}"
         )
 
-    # ── Stages 3 + 4: LLM slide spec → PPTX ─────────────────────────
-    pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
-    try:
-        buf, slide_spec = await generate_gfd_dashboard(
-            extracted_data=extracted,
-            llm_config=LLM_CONFIG,
-            session_id=session_id,
-            output_path=pptx_path,
-            glossary_context=glossary_prompt_text,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Slide generation failed: {str(e)}"
-        )
-
-    # ── Store session ─────────────────────────────────────────────────
+    # ── Store session (no slide_spec yet) ─────────────────────────────
     gfd_sessions[session_id] = {
         "session_id": session_id,
         "filename": file.filename,
         "file_path": str(file_path),
-        "pptx_path": pptx_path,
+        "pptx_path": None,
         "extracted": extracted,
-        "slide_spec": slide_spec,
+        "slide_spec": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ── Build response summary ────────────────────────────────────────
+    # ── Build response with full extracted data for review ────────────
     meta = extracted.get("_meta", {})
+
+    return {
+        "session_id": session_id,
+        "filename": file.filename,
+        "current_cw": extracted.get("current_cw", ""),
+        "total_rows_in_file": meta.get("total_rows_in_file", 0),
+        "rows_after_filter": meta.get("rows_after_filter", 0),
+        "history_weeks": history_weeks,
+        "product_groups": extracted.get("product_groups", []),
+        "extraction_notes": extracted.get("extraction_notes", ""),
+        "warnings": extracted.get("warnings", []),
+    }
+
+
+@app.post("/api/gfd/generate")
+async def generate_gfd(session_id: str = Form(...), format: str = Form("pptx")):
+    """
+    Generate the GFD dashboard from previously extracted data (Stage 3 + 4).
+
+    Runs the LLM slide-spec generation and PPTX/DOCX rendering.
+    Must be called after /api/gfd/upload.
+
+    Form fields:
+      session_id : from the upload response
+      format     : "pptx" or "docx" (default: "pptx")
+    """
+    if session_id not in gfd_sessions:
+        raise HTTPException(status_code=404, detail="GFD session not found. Please upload first.")
+
+    sess = gfd_sessions[session_id]
+    extracted = sess.get("extracted")
+    if not extracted:
+        raise HTTPException(status_code=400, detail="No extracted data in session.")
+
+    # ── Run Stages 3 + 4 if not already generated ────────────────────
+    if sess.get("slide_spec") is None:
+        pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
+        try:
+            buf, slide_spec = await generate_gfd_dashboard(
+                extracted_data=extracted,
+                llm_config=LLM_CONFIG,
+                session_id=session_id,
+                output_path=pptx_path,
+                glossary_context=glossary_prompt_text,
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Slide generation failed: {str(e)}"
+            )
+        sess["slide_spec"] = slide_spec
+        sess["pptx_path"] = pptx_path
+
+    slide_spec = sess["slide_spec"]
+    meta = extracted.get("_meta", {})
+
     pg_overview = [
         {
             "product_family": pg.get("product_family_desc", ""),
@@ -506,16 +546,11 @@ async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(4))
 
     return {
         "session_id": session_id,
-        "filename": file.filename,
+        "filename": sess["filename"],
         "current_cw": extracted.get("current_cw", ""),
-        "total_rows_in_file": meta.get("total_rows_in_file", 0),
-        "rows_after_filter": meta.get("rows_after_filter", 0),
-        "history_weeks": history_weeks,
         "product_groups": pg_overview,
         "overall_risk": slide_spec.get("overall_risk", ""),
-        "slide_count": slide_spec.get("slide_count", 1),
-        "warnings": extracted.get("warnings", []),
-        "extraction_notes": extracted.get("extraction_notes", ""),
+        "slide_count": slide_spec.get("slide_count", len(slide_spec.get("slides", []))),
         "is_fallback": slide_spec.get("_fallback", False),
     }
 
@@ -527,6 +562,9 @@ async def download_gfd_pptx(session_id: str = Query(...)):
         raise HTTPException(status_code=404, detail="GFD session not found.")
 
     sess = gfd_sessions[session_id]
+    if not sess.get("pptx_path"):
+        raise HTTPException(status_code=400, detail="Dashboard not yet generated. Call /api/gfd/generate first.")
+
     pptx_path = Path(sess["pptx_path"])
 
     if not pptx_path.exists():
@@ -542,6 +580,29 @@ async def download_gfd_pptx(session_id: str = Query(...)):
     )
 
 
+@app.get("/api/gfd/download/docx")
+async def download_gfd_docx(session_id: str = Query(...)):
+    """Download the GFD dashboard as a formatted .docx Word document."""
+    if session_id not in gfd_sessions:
+        raise HTTPException(status_code=404, detail="GFD session not found.")
+
+    sess = gfd_sessions[session_id]
+    slide_spec = sess.get("slide_spec")
+    if not slide_spec:
+        raise HTTPException(status_code=400, detail="Dashboard not yet generated. Call /api/gfd/generate first.")
+
+    buf = gfd_spec_to_docx(slide_spec)
+
+    source_name = sess.get("filename", "dashboard")
+    download_name = f"GFD_Dashboard_{source_name.replace('.xlsx', '')}.docx"
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
 @app.get("/api/gfd/session/{session_id}")
 async def get_gfd_session(session_id: str):
     """Return metadata for a GFD session."""
@@ -550,13 +611,8 @@ async def get_gfd_session(session_id: str):
 
     sess = gfd_sessions[session_id]
     extracted = sess.get("extracted", {})
-    slide_spec = sess.get("slide_spec", {})
+    slide_spec = sess.get("slide_spec") or {}
     meta = extracted.get("_meta", {})
-
-    overview_slide = next(
-        (s for s in slide_spec.get("slides", []) if s.get("type") == "overview"),
-        {}
-    )
 
     return {
         "session_id": session_id,
@@ -565,9 +621,10 @@ async def get_gfd_session(session_id: str):
         "current_cw": extracted.get("current_cw", ""),
         "extraction_notes": extracted.get("extraction_notes", ""),
         "warnings": extracted.get("warnings", []),
-        "overall_risk": slide_spec.get("overall_risk", overview_slide.get("overall_risk")),
-        "slide_count": slide_spec.get("slide_count", len(slide_spec.get("slides", []))),
+        "overall_risk": slide_spec.get("overall_risk", ""),
+        "slide_count": slide_spec.get("slide_count", 0),
         "is_fallback": slide_spec.get("_fallback", False),
+        "is_generated": sess.get("slide_spec") is not None,
         "product_groups": [
             {
                 "product_family": pg.get("product_family_desc", ""),
