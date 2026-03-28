@@ -510,7 +510,7 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
     #    the user can inspect / debug the extraction independently.
     csv_path = str(Path(filepath).with_suffix(".csv"))
     try:
-        df.to_csv(csv_path, index=False)
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
         warnings.append(f"Extracted CSV saved: {csv_path}")
     except Exception as csv_exc:
         warnings.append(f"Could not save extracted CSV: {csv_exc}")
@@ -558,7 +558,7 @@ def excel_to_text_table(filepath: str, **_kwargs) -> dict:
         Path(filepath).stem + "_filtered.csv"
     ))
     try:
-        df.to_csv(filtered_csv_path, index=False)
+        df.to_csv(filtered_csv_path, index=False, encoding="utf-8-sig")
         warnings.append(f"Filtered CSV saved: {filtered_csv_path} ({kept_rows} rows)")
     except Exception as fcsv_exc:
         warnings.append(f"Could not save filtered CSV: {fcsv_exc}")
