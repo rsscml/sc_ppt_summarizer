@@ -931,7 +931,8 @@ async def llm_extract_gfd_data(
 
             # ── Dump raw LLM response for debugging ──────────────────
             try:
-                raw_dump_dir = Path(stage1.get("csv_path", filepath)).parent
+                csv_path = stage1.get("csv_path")
+                raw_dump_dir = Path(csv_path).parent if csv_path else Path(".")
                 raw_dump_path = raw_dump_dir / f"{session_id}_llm_extract_attempt{attempt}_raw.txt"
                 raw_dump_path.write_text(raw, encoding="utf-8")
                 print(f"[GFD DEBUG] Raw LLM response saved: {raw_dump_path} "
