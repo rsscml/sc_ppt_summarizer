@@ -340,6 +340,18 @@ RAG COLOUR COMPUTATION (per row, per CW column):
 
 Respond with ONLY valid JSON — no markdown fences, no explanation text.
 
+CRITICAL JSON RULES:
+  • No literal newline, tab, or carriage-return characters inside string values.
+    The source data often contains line breaks in free-text fields — replace them
+    with "; " (semicolon-space) or " " (space) to keep strings single-line.
+  • The ONLY exception is the escaped sequence \\n which you should use where the
+    slide renderer needs a line break (e.g. product_group "Compressors\\n(11)" and
+    kb_coverage "CW17\\nCW21").  This is the two-character sequence backslash-n,
+    NOT a literal newline.
+  • No trailing commas before }} or ]].
+  • The output must be parseable by a strict JSON parser (Python json.loads)
+    without any post-processing.
+
 {{
   "presentation_title": "Global Fulfilment Dashboard",
   "current_cw": "CW13/2026",
@@ -436,6 +448,15 @@ async def llm_generate_slide_spec(
     try:
         response = await llm.ainvoke(messages)
         raw = response.content.strip()
+
+        # ── Dump raw LLM response for debugging ──────────────────
+        try:
+            raw_dump_path = Path(__file__).parent / "uploads" / f"{session_id}_llm_slidespec_raw.txt"
+            raw_dump_path.write_text(raw, encoding="utf-8")
+            print(f"[GFD DEBUG] Raw slide-spec LLM response saved: {raw_dump_path} "
+                  f"({len(raw):,} chars)")
+        except Exception as dump_exc:
+            print(f"[GFD DEBUG] Could not save raw slide-spec response: {dump_exc}")
 
         spec: dict = _parse_llm_json(raw, session_id=session_id)
 

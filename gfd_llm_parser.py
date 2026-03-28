@@ -108,12 +108,12 @@ def _repair_llm_json(raw: str, debug_label: str = "") -> str:
 
 def _parse_llm_json(raw: str, session_id: str = "", attempt: int = 0) -> dict:
     """
-    Parse LLM JSON output with mandatory repair and detailed error diagnostics.
+    Parse LLM JSON output with safety-net repair and detailed error diagnostics.
 
-    Always applies _repair_llm_json before parsing — this is not optional
-    because the source Excel data routinely contains newlines, tabs, and
-    other control characters in free-text fields that the LLM reproduces
-    as literal characters inside JSON string values.
+    The LLM is instructed to produce clean, single-line JSON strings (no literal
+    newlines/tabs, no trailing commas).  The repair step here is a safety net for
+    the occasional case where the model still emits a control character despite
+    the prompt instructions.
 
     On failure, logs the region around the error position so you can
     see exactly what broke.
@@ -137,14 +137,6 @@ def _parse_llm_json(raw: str, session_id: str = "", attempt: int = 0) -> dict:
         print(f"[GFD ERROR] Context around error position:")
         print(f"  ...{context}...")
         print(f"  {' ' * (pointer_offset + 5)}^ error here")
-
-        # Save the raw LLM response for post-mortem inspection
-        try:
-            dump_path = Path(f"/tmp/gfd_llm_raw_{session_id}_attempt{attempt}.txt")
-            dump_path.write_text(raw, encoding="utf-8")
-            print(f"[GFD ERROR] Raw LLM response saved: {dump_path}")
-        except Exception:
-            pass
 
         raise
 
@@ -746,7 +738,15 @@ structured JSON object.
    — Extract the CW number as a plain INTEGER (e.g. "CW15" → 15, "KW15/2026" → 15).
    — If the cell is empty or unparseable, use null.
 
-3. TEXT FIELDS — preserve verbatim. Do NOT paraphrase, shorten, or infer missing info.
+3. TEXT FIELDS — preserve the content verbatim but flatten to single-line strings.
+   Excel cells often contain line breaks, tabs, and other control characters.
+   Replace these with a semicolon-space ("; ") or a plain space to keep all text
+   on one line.  Do NOT use literal newline or tab characters inside JSON string
+   values — these break JSON parsing.
+   Example: a cell containing
+       "Dual source activation CW14
+        Air freight bridge 3 weeks"
+   should become: "Dual source activation CW14; Air freight bridge 3 weeks"
 
 4. BOOLEAN-LIKE FIELDS (Customer Informed, Allocation Mode, Force Majeure / FM):
    Normalise to exactly one of: "Yes", "No", "In progress", "N/A".
@@ -771,6 +771,14 @@ structured JSON object.
 ═══ OUTPUT FORMAT ═══
 
 Respond with ONLY valid JSON — no markdown fences, no explanation text.
+
+CRITICAL JSON RULES:
+  • Every string value must be a single line — no literal newline, tab, or
+    carriage-return characters inside strings.  Replace line breaks from the
+    source data with "; " (semicolon-space) or " " (space).
+  • No trailing commas before }} or ]].
+  • The output must be parseable by a strict JSON parser (Python json.loads)
+    without any post-processing.
 
 {{
   "current_cw": "CW13/2026",
@@ -920,6 +928,16 @@ async def llm_extract_gfd_data(
         try:
             response = await llm.ainvoke(messages)
             raw = response.content.strip()
+
+            # ── Dump raw LLM response for debugging ──────────────────
+            try:
+                raw_dump_dir = Path(stage1.get("csv_path", filepath)).parent
+                raw_dump_path = raw_dump_dir / f"{session_id}_llm_extract_attempt{attempt}_raw.txt"
+                raw_dump_path.write_text(raw, encoding="utf-8")
+                print(f"[GFD DEBUG] Raw LLM response saved: {raw_dump_path} "
+                      f"({len(raw):,} chars)")
+            except Exception as dump_exc:
+                print(f"[GFD DEBUG] Could not save raw LLM response: {dump_exc}")
 
             extracted = _parse_llm_json(raw, session_id=session_id, attempt=attempt)
 
