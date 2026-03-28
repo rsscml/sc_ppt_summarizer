@@ -20,8 +20,8 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from ppt_parser import parse_presentation
 from glossary import load_glossary_dir, load_glossary_file, normalise_json, render_glossary_for_prompt
 from docx_export import markdown_to_docx
-from gfd_excel_parser import parse_dashboard_update, summarise_for_prompt, filter_by_recency
-from gfd_slide_generator import generate_gfd_slides
+from gfd_llm_parser import parse_gfd_with_llm
+from gfd_llm_slides import generate_gfd_dashboard
 from agent import (
     build_summarization_graph,
     refine_summary,
@@ -433,8 +433,16 @@ async def delete_glossary_file(filename: str):
 # ─── Routes: GFD Dashboard ──────────────────────────────────────────
 
 @app.post("/api/gfd/upload")
-async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(2)):
-    """Upload an Excel file, parse Dashboard_Update, generate GFD slides."""
+async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(4)):
+    """
+    Upload a Dashboard_Update Excel file.
+
+    Pipeline:
+      Stage 1 — deterministic: Excel → filtered pipe-delimited text table
+      Stage 2 — LLM extraction: text table → structured JSON (product groups, CW integers)
+      Stage 3 — LLM slide spec: extracted JSON → complete slide specification
+      Stage 4 — PPTX renderer: slide spec → .pptx file
+    """
     if not file.filename.endswith((".xlsx", ".xls", ".xlsm")):
         raise HTTPException(status_code=400, detail="Please upload an .xlsx file.")
 
@@ -443,75 +451,77 @@ async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(2))
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Parse the Dashboard_Update worksheet
+    # ── Stages 1 + 2: Excel → LLM-extracted JSON ─────────────────────
     try:
-        parsed = parse_dashboard_update(str(file_path))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse Excel: {str(e)}")
-
-    # Apply recency filter (0 = no filter, include everything)
-    if history_weeks > 0:
-        parsed = filter_by_recency(parsed, history_weeks=history_weeks)
-
-    # Generate the PPTX slides
-    #try:
-    #    pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
-    #    buf = generate_gfd_slides(parsed["product_groups"], output_path=pptx_path)
-    #except Exception as e:
-    #    raise HTTPException(status_code=500, detail=f"Failed to generate slides: {str(e)}")
-    # Run LLM interpretation pipeline
-    try:
-        gfd_result = await run_gfd_pipeline(
-            session_id=session_id,
+        extracted = await parse_gfd_with_llm(
+            filepath=str(file_path),
             llm_config=LLM_CONFIG,
-            parsed_data=parsed,
+            session_id=session_id,
+            history_weeks=history_weeks,
             glossary_context=glossary_prompt_text,
         )
     except Exception as e:
-        gfd_result = None
+        raise HTTPException(
+            status_code=500,
+            detail=f"Excel parsing / LLM extraction failed: {str(e)}"
+        )
 
-    # Generate the PPTX slides
+    # ── Stages 3 + 4: LLM slide spec → PPTX ─────────────────────────
+    pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
     try:
-        pptx_path = str(UPLOAD_DIR / f"{session_id}_gfd_dashboard.pptx")
-        if gfd_result:
-            buf = generate_gfd_slides(
-                gfd_result["interpreted_groups"],
-                executive_overview=gfd_result["executive_overview"],
-                output_path=pptx_path,
-            )
-        else:
-            buf = generate_gfd_slides(parsed["product_groups"], output_path=pptx_path)
+        buf, slide_spec = await generate_gfd_dashboard(
+            extracted_data=extracted,
+            llm_config=LLM_CONFIG,
+            session_id=session_id,
+            output_path=pptx_path,
+            glossary_context=glossary_prompt_text,
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate slides: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Slide generation failed: {str(e)}"
+        )
 
-    # Store session
+    # ── Store session ─────────────────────────────────────────────────
     gfd_sessions[session_id] = {
         "session_id": session_id,
         "filename": file.filename,
         "file_path": str(file_path),
         "pptx_path": pptx_path,
-        "parsed": parsed,
+        "extracted": extracted,
+        "slide_spec": slide_spec,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Build response summary
-    pg_overview = []
-    for pg in parsed["product_groups"]:
-        pg_overview.append({
-            "product_family": pg["product_family_desc"],
-            "code": pg["product_family_code"],
-            "risk_items": len(pg["rows"]),
-        })
+    # ── Build response summary ────────────────────────────────────────
+    meta = extracted.get("_meta", {})
+    pg_overview = [
+        {
+            "product_family": pg.get("product_family_desc", ""),
+            "code": pg.get("product_family_code", ""),
+            "risk_items": len(pg.get("rows", [])),
+        }
+        for pg in extracted.get("product_groups", [])
+    ]
+
+    overview_slide = next(
+        (s for s in slide_spec.get("slides", []) if s.get("type") == "overview"),
+        {}
+    )
 
     return {
         "session_id": session_id,
         "filename": file.filename,
-        "total_rows": parsed["metadata"]["total_rows"],
-        "product_groups": pg_overview,
-        "warnings": parsed["warnings"],
-        "header_rows": parsed["metadata"]["header_rows"],
-        "mapped_columns": parsed["metadata"]["mapped_columns"],
+        "current_cw": extracted.get("current_cw", ""),
+        "total_rows_in_file": meta.get("total_rows_in_file", 0),
+        "rows_after_filter": meta.get("rows_after_filter", 0),
         "history_weeks": history_weeks,
+        "product_groups": pg_overview,
+        "overall_risk": overview_slide.get("overall_risk", ""),
+        "slide_count": len(slide_spec.get("slides", [])),
+        "warnings": extracted.get("warnings", []),
+        "extraction_notes": extracted.get("extraction_notes", ""),
+        "is_fallback": slide_spec.get("_fallback", False),
     }
 
 
@@ -544,23 +554,41 @@ async def get_gfd_session(session_id: str):
         raise HTTPException(status_code=404, detail="GFD session not found.")
 
     sess = gfd_sessions[session_id]
-    parsed = sess["parsed"]
+    extracted = sess.get("extracted", {})
+    slide_spec = sess.get("slide_spec", {})
+    meta = extracted.get("_meta", {})
+
+    overview_slide = next(
+        (s for s in slide_spec.get("slides", []) if s.get("type") == "overview"),
+        {}
+    )
 
     return {
         "session_id": session_id,
         "filename": sess["filename"],
         "created_at": sess["created_at"],
-        "metadata": parsed["metadata"],
-        "warnings": parsed["warnings"],
+        "current_cw": extracted.get("current_cw", ""),
+        "extraction_notes": extracted.get("extraction_notes", ""),
+        "warnings": extracted.get("warnings", []),
+        "overall_risk": overview_slide.get("overall_risk"),
+        "slide_count": len(slide_spec.get("slides", [])),
+        "is_fallback": slide_spec.get("_fallback", False),
         "product_groups": [
             {
-                "product_family": pg["product_family_desc"],
-                "code": pg["product_family_code"],
-                "risk_items": len(pg["rows"]),
+                "product_family": pg.get("product_family_desc", ""),
+                "code": pg.get("product_family_code", ""),
+                "risk_items": len(pg.get("rows", [])),
             }
-            for pg in parsed["product_groups"]
+            for pg in extracted.get("product_groups", [])
         ],
+        "metadata": {
+            "total_rows_in_file": meta.get("total_rows_in_file", 0),
+            "rows_after_filter": meta.get("rows_after_filter", 0),
+            "sheet_used": meta.get("sheet_used", ""),
+            "headers_detected": len(meta.get("headers", [])),
+        },
     }
+
 
 if __name__ == "__main__":
     import uvicorn
