@@ -41,9 +41,10 @@ Additionally, the app generates a **Global Fulfilment Dashboard** presentation d
 │  ┌────────────────────────────────────┐  │
 │  │   GFD Dashboard Pipeline           │  │
 │  │                                    │  │
-│  │  Stage 1 — Deterministic filter    │  │
-│  │     Excel → merge-resolved,        │  │
-│  │     date-filtered text table       │  │
+│  │  Stage 1 — Pandas extraction       │  │
+│  │     Excel → clean DataFrame,       │  │
+│  │     CSV artifact, month-filtered   │  │
+│  │     pipe-delimited text table      │  │
 │  │              ↓                     │  │
 │  │  Stage 2 — LLM extraction          │  │
 │  │     Text table → structured JSON   │  │
@@ -63,7 +64,7 @@ Additionally, the app generates a **Global Fulfilment Dashboard** presentation d
 │                                          │
 │  PPT Parser (python-pptx)                │
 │  Glossary Loader (multi-format JSON)     │
-│  GFD LLM Parser (openpyxl + LLM)        │
+│  GFD LLM Parser (pandas + LLM)          │
 │  GFD LLM Slides (LLM + python-pptx)     │
 └──────────────────────────────────────────┘
 ```
@@ -122,7 +123,7 @@ Open http://localhost:8000
 
 **PPT Summarizer:** Upload your `.pptx` → review detected sections → generate outputs → switch between **Slide Summary** and **Email Summary** tabs → refine each independently via chat.
 
-**GFD Dashboard:** Upload your `.xlsx` containing the `Dashboard_Update` worksheet → download the generated `.pptx` with color-coded CW risk heatmap.
+**GFD Dashboard:** Upload your `.xlsx` containing the `Dashboard_Update` worksheet → review extracted product groups and the full LLM-produced JSON → generate and download the `.pptx` or `.docx` with color-coded CW risk heatmap.
 
 ---
 
@@ -132,7 +133,7 @@ Open http://localhost:8000
 
 The GFD module converts the `Dashboard_Update` Excel worksheet into presentation-ready slides showing a forward-looking calendar-week risk heatmap. Each row in the Excel represents a delivery risk for a product family at a specific plant, and the generated slides show whether supply coverage extends across the next 12 weeks plus the following quarter.
 
-The pipeline is fully LLM-driven for both content extraction and slide generation. Only the initial staleness filter is deterministic — everything else is handled by the model, which means product groupings, column semantics, customer lists, and narrative summaries are understood rather than pattern-matched.
+Stage 1 (Excel extraction and row filtering) is fully deterministic using pandas, producing a clean CSV intermediate artifact and a filtered pipe-delimited text table. Stages 2 and 3 are LLM-driven — the model handles product groupings, column semantics, customer lists, RAG color computation, and narrative summaries. Stage 4 is a thin deterministic PPTX renderer.
 
 ### Slide Layout
 
@@ -170,15 +171,16 @@ The **next-quarter summary column** (e.g., Q2) shows the worst-case RAG across a
 
 ### Four-Stage Pipeline
 
-#### Stage 1 — Deterministic filter (`gfd_llm_parser.py`)
+#### Stage 1 — Pandas extraction (`gfd_llm_parser.py`)
 
-The only deterministic stage. Opens the workbook with openpyxl and performs three operations:
+The only deterministic stage. Uses a pandas-based extractor for robust parsing of messy real-world Excel files:
 
-- **Merge resolution** — builds a complete master→slave map so every merged slave cell carries its group value. This is what makes product-family grouping reliable: formerly-merged cells now appear in every row of the text table.
-- **Header detection** — scores each row for supply-chain keyword density (scans up to 60 rows, merge-aware). Correctly handles title blocks, logo rows, instruction text, or any other preamble above the real header — no assumption is made about which row number the header will be on.
-- **Sub-header combining** — if the row immediately below the header also scores as header-like (score ≥ 2), its cells are merged into the header strings. If the row scores low (i.e. it is the first data row), combining is skipped — preventing data values from being absorbed into column names.
-- **Customer column compaction** — the standard template has 32 individual OEM/customer columns (W–BB) under a merged "Customer affected" super-header. These are detected automatically via the merged super-header and collapsed into a single `Customers affected` column whose value lists only the customers flagged as affected in each row. This reduces a 64-column table to ~33 columns.
-- **Staleness filter** — detects the `Last update` column (or equivalent) using a prioritised list of hints including German variants (`aktualisiert`, `last änderung`). The raw openpyxl cell value — which may be a native `datetime` object, an Excel serial number, or a lazily typed string — is parsed through multiple date format patterns covering European (`dd.mm.yyyy`), ISO, US, two-digit year, and year-less entry styles. Rows whose update date is older than `history_weeks` weeks are dropped. Falls back to scanning rows for `CW`/`KW` references if no date column is found.
+- **Header detection** — reads the sheet with `pd.read_excel(header=None)` and scores each row using anchor-based matching against expected GFD template fields (`Customer affected`, `Region`, `Plant / Location`, `Root Cause`, `Action / Comment`, `Task Force Leader`, `Last update`). The scoring combines anchor hits, non-empty cell count, uniqueness ratio, and a numeric-row penalty to reliably find the header even when title rows, logos, or instructions sit above it.
+- **Column deduplication** — blank headers are renamed to `Unnamed_N`; duplicate headers are suffixed with `__1`, `__2`, etc. Trailing empty columns are dropped.
+- **Forward-fill for merged cells** — pandas reads merged slave cells as NaN. Columns whose header contains product-group keywords (`product`, `family`, `group`, `region`, etc.) are forward-filled so every row carries its group value.
+- **CSV artifact** — the full clean DataFrame is written to a `.csv` file alongside the uploaded Excel before any filtering or compaction. This intermediate artifact can be inspected or reused independently of the pipeline.
+- **Customer column compaction** — detects the ~32 individual OEM/customer flag columns heuristically (longest contiguous run of ≥ 5 columns where > 70% of values are single-character flags like X, Y, N). These are collapsed into a single `Customers affected` column listing only the flagged customer names per row.
+- **Month-based recency filter** — uses the `Last update` column exclusively. Keeps rows from the **current calendar month and the previous calendar month** (e.g., if today is March 28, 2026, the window is Feb 1 – Mar 31, 2026). Rows with unparseable dates are kept (benefit of the doubt). If no date column is found, all rows are retained with a warning — there is no CW-number fallback.
 
 The stage produces a compact pipe-delimited text table: clean headers, apostrophe-stripped values, customer columns compacted, stale rows removed.
 
@@ -217,21 +219,23 @@ The parser is designed for real-world files and makes no assumptions about row p
 
 | Challenge | How it's handled |
 |---|---|
-| Title / logo rows above the header | Keyword-scoring scan up to row 60; highest-scoring row wins |
-| Multi-row stacked headers | Sub-header row combined only when it itself scores as header-like |
-| Merged product-group cells | Full master→slave map built before any row is read |
-| 32 individual customer columns | Auto-detected via merged "Customer affected" super-header, compacted to one column |
+| Title / logo rows above the header | Anchor-based scoring with uniqueness ratio and numeric penalty; highest-scoring row wins |
+| Duplicate or blank header names | Blanks renamed to `Unnamed_N`; duplicates suffixed `__1`, `__2`, etc. |
+| Merged product-group cells | Forward-fill on columns matching group keywords (`product`, `family`, `group`, `region`) |
+| 32 individual customer columns | Heuristic detection (≥ 5 contiguous flag-like columns), compacted to one column |
 | Leading apostrophes in cell values | Stripped in the normalisation step (common in template files) |
-| Lazy date entry formats | 14 format patterns tried; native `datetime` objects used directly when available |
-| No "Last update" column | Falls back to CW-number scanning across row text |
+| Lazy date entry formats | 14 format patterns tried; pandas Timestamps and native `datetime` objects used directly when available |
+| No "Last update" column | All rows retained with a warning (no fallback heuristic) |
 | LLM extraction failure | Deterministic fallback spec still produces a valid dashboard |
 
 ### GFD API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/gfd/upload` | Upload `.xlsx`, run all four pipeline stages, return session metadata |
+| POST | `/api/gfd/upload` | Upload `.xlsx`, run Stages 1 + 2 (extraction), return extracted JSON for review |
+| POST | `/api/gfd/generate` | Run Stages 3 + 4 (slide spec + PPTX rendering) from previously extracted data |
 | GET | `/api/gfd/download` | Download generated `.pptx`. Query param: `session_id` |
+| GET | `/api/gfd/download/docx` | Download generated `.docx`. Query param: `session_id` |
 | GET | `/api/gfd/session/{id}` | Session metadata including product groups, warnings, overall risk, and whether the fallback renderer was used |
 
 **Upload form fields:**
@@ -239,19 +243,18 @@ The parser is designed for real-world files and makes no assumptions about row p
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `file` | `.xlsx` | — | The Excel workbook containing `Dashboard_Update` |
-| `history_weeks` | int | `4` | Rows with `Last update` older than this many weeks are excluded |
 
 **Upload response includes:**
 
 | Field | Description |
 |---|---|
 | `current_cw` | Calendar week label used for the dashboard (e.g. `CW13/2026`) |
-| `product_groups` | List of extracted product groups with row counts |
-| `overall_risk` | Aggregate risk level from the executive overview slide |
-| `slide_count` | Total number of slides generated |
+| `total_rows_in_file` | Row count before date filtering |
+| `rows_after_filter` | Row count after month-based filtering |
+| `product_groups` | List of extracted product groups with full row data |
 | `extraction_notes` | LLM comments on data quality or structural ambiguities |
-| `is_fallback` | `true` if the deterministic fallback renderer was used instead of the LLM slide spec |
-| `warnings` | List of parser warnings (rows dropped, date column used, etc.) |
+| `warnings` | List of parser warnings (rows dropped, date column used, CSV path, etc.) |
+| `extracted_json` | Full LLM-produced JSON (for validation in the UI) |
 
 ---
 
@@ -290,7 +293,7 @@ Each output can be downloaded as a formatted `.docx` Word document via a discret
 | URL | Description |
 |-----|-------------|
 | `/` | Main interface — upload, glossary, tabbed outputs, chat refinement |
-| `/gfd` | GFD Dashboard — upload Excel, download PPTX |
+| `/gfd` | GFD Dashboard — upload Excel, review extracted JSON, download PPTX/DOCX |
 | `/tracing` | Execution trace dashboard |
 | `/tokens` | Token usage dashboard |
 
@@ -306,7 +309,7 @@ Each output can be downloaded as a formatted `.docx` Word document via a discret
 
 **Email Status Summary** — The same section summaries feed a separate LLM call with a dedicated prompt following the crisis-status email template. Only sections with substantive data are included.
 
-**GFD Dashboard Generation** — `gfd_llm_parser.py` performs a minimal deterministic read of the Excel file (merge resolution, header detection, customer column compaction, date-based staleness filtering) and converts the result to a pipe-delimited text table. This table is then passed to an LLM which extracts a fully typed JSON structure covering all product groups and risk rows. A second LLM call uses that JSON to generate a complete slide specification — RAG colors, condensed text, overview narrative, risk levels. A thin PPTX renderer then converts the spec to a `.pptx` file without applying any business logic of its own.
+**GFD Dashboard Generation** — `gfd_llm_parser.py` uses a pandas-based extractor to read the Excel file: anchor-scored header detection, forward-filling of merged cells, customer column compaction, and month-based date filtering (current + previous month only, based on the `Last update` column). A clean CSV artifact is saved before filtering for independent inspection. The filtered data is converted to a pipe-delimited text table and passed to an LLM which extracts a fully typed JSON structure covering all product groups and risk rows. The full extracted JSON is returned to the UI for validation before slide generation. A second LLM call uses that JSON to generate a complete slide specification — RAG colors, condensed text, overview narrative, risk levels. A thin PPTX renderer then converts the spec to a `.pptx` file without applying any business logic of its own.
 
 **Refinement** — Each output (slides or email) can be refined independently via chat. The refine endpoint accepts a `target` parameter (`slides` or `email`) and routes to the appropriate prompt, which has access to both the current output and the original section summaries.
 
@@ -324,8 +327,9 @@ supply-chain-summarizer/
 ├── agent.py                      # LangGraph agent, prompts, tracing
 ├── glossary.py                   # Glossary loader & prompt renderer
 ├── docx_export.py                # Markdown → Word document converter
-├── gfd_llm_parser.py             # GFD Stage 1+2: Excel filter → LLM extraction
+├── gfd_llm_parser.py             # GFD Stage 1+2: pandas extraction → CSV → LLM extraction
 ├── gfd_llm_slides.py             # GFD Stage 3+4: LLM slide spec → PPTX renderer
+├── gfd_docx_export.py            # GFD slide spec → formatted Word document table
 ├── requirements.txt
 ├── glossary/                     # Company glossary JSON files
 │   └── _sample_glossary.json     # Example with 58 entries
@@ -355,8 +359,10 @@ supply-chain-summarizer/
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/gfd/upload` | Upload `.xlsx`, run four-stage pipeline, return metadata. Form fields: `file`, `history_weeks` (default `4`) |
+| POST | `/api/gfd/upload` | Upload `.xlsx`, run Stages 1 + 2, return extracted JSON for review. Form field: `file` |
+| POST | `/api/gfd/generate` | Run Stages 3 + 4 from extracted data. Form fields: `session_id`, `format` (`pptx` or `docx`) |
 | GET | `/api/gfd/download` | Download generated `.pptx`. Query param: `session_id` |
+| GET | `/api/gfd/download/docx` | Download generated `.docx`. Query param: `session_id` |
 | GET | `/api/gfd/session/{id}` | Session metadata: product groups, warnings, overall risk, slide count, fallback flag |
 
 ### Glossary
