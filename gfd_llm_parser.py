@@ -406,41 +406,59 @@ def _parse_date_value(raw: Any) -> date | None:
     return None
 
 
-def _filter_stale_rows(
+def _get_recent_month_window() -> tuple[date, date, str]:
+    """
+    Compute the date window for "current month + previous month".
+
+    Returns (window_start, window_end, description) where:
+      window_start = 1st day of the previous month
+      window_end   = last day of the current month
+    """
+    today = date.today()
+    # First day of current month
+    first_of_current = today.replace(day=1)
+    # First day of previous month
+    if today.month == 1:
+        first_of_previous = date(today.year - 1, 12, 1)
+    else:
+        first_of_previous = date(today.year, today.month - 1, 1)
+    # Last day of current month
+    if today.month == 12:
+        last_of_current = date(today.year, 12, 31)
+    else:
+        last_of_current = date(today.year, today.month + 1, 1) - timedelta(days=1)
+
+    prev_label = first_of_previous.strftime("%b %Y")
+    curr_label = first_of_current.strftime("%b %Y")
+    desc = f"{prev_label} – {curr_label}"
+
+    return first_of_previous, last_of_current, desc
+
+
+def _filter_by_recent_months(
     df: pd.DataFrame,
     date_col: str,
-    cutoff: date,
-) -> tuple[pd.DataFrame, int]:
+) -> tuple[pd.DataFrame, int, str]:
     """
-    Remove rows whose date_col value is strictly before cutoff.
+    Keep only rows whose 'Last update' falls within the current calendar
+    month or the previous calendar month.
 
     Rows where the date is unparseable are KEPT (benefit of the doubt).
-    Returns (filtered_df, num_removed).
+
+    Returns (filtered_df, num_removed, window_description).
     """
+    window_start, window_end, desc = _get_recent_month_window()
+
     keep_mask = pd.Series(True, index=df.index)
     for idx in df.index:
         raw = df.at[idx, date_col]
         parsed = _parse_date_value(raw)
-        if parsed is not None and parsed < cutoff:
-            keep_mask[idx] = False
+        if parsed is not None:
+            if parsed < window_start or parsed > window_end:
+                keep_mask[idx] = False
 
     filtered = df[keep_mask]
-    return filtered, int((~keep_mask).sum())
-
-
-# ─── CW-number fallback staleness ────────────────────────────────────
-
-def _is_stale_by_cw(cells: list[str], current_week: int, history_weeks: int) -> bool:
-    """
-    Fallback: return True only when the row contains CW/KW references AND
-    every one of them is older than (current_week − history_weeks).
-    """
-    cutoff_week = current_week - history_weeks
-    row_text = " ".join(cells)
-    cw_nums = [int(m) for m in re.findall(r"\b(?:CW|KW|W)(\d{1,2})\b", row_text, re.IGNORECASE)]
-    if not cw_nums:
-        return False
-    return all(n < cutoff_week for n in cw_nums)
+    return filtered, int((~keep_mask).sum()), desc
 
 
 # ─── Text table builder ─────────────────────────────────────────────
@@ -483,14 +501,16 @@ def _build_text_table(headers: list[str], rows: list[list[str]]) -> str:
 
 # ─── Main Stage 1 entry point ───────────────────────────────────────
 
-def excel_to_text_table(filepath: str, history_weeks: int = 4) -> dict:
+def excel_to_text_table(filepath: str, **_kwargs) -> dict:
     """
     Stage 1 (deterministic): Open the Excel workbook and produce a
-    pipe-delimited text table with stale rows removed.
+    pipe-delimited text table with rows filtered to the current and
+    previous calendar month.
 
     Uses the pandas-based extractor for robust header detection and
-    data extraction, then applies date filtering and customer column
-    compaction before building the text table.
+    data extraction, then applies month-based date filtering (solely
+    on the 'Last update' column) and customer column compaction
+    before building the text table.
 
     Returns
     -------
@@ -553,50 +573,32 @@ def excel_to_text_table(filepath: str, history_weeks: int = 4) -> dict:
             f"'Customers affected'."
         )
 
-    # ── Filter stale rows ────────────────────────────────────────────
+    # ── Filter rows by recency (current month + previous month) ────────
     date_col_name = _find_date_column(list(df.columns))
 
     if date_col_name:
+        df, skipped, window_desc = _filter_by_recent_months(df, date_col_name)
         warnings.append(
-            f"Recency filter: using '{date_col_name}' column for date-based filtering."
+            f"Recency filter: keeping rows from {window_desc} "
+            f"(based on '{date_col_name}' column)."
         )
+        if skipped:
+            warnings.append(
+                f"Recency filter: removed {skipped} row(s) outside the "
+                f"{window_desc} window."
+            )
     else:
         warnings.append(
-            "Recency filter: no 'Last updated' column found — "
-            "falling back to CW-number scanning."
+            "Recency filter: no 'Last update' column found — "
+            "all rows retained (no filtering applied)."
         )
-
-    if history_weeks > 0:
-        cutoff_date = date.today() - timedelta(weeks=history_weeks)
-
-        if date_col_name:
-            df, skipped = _filter_stale_rows(df, date_col_name, cutoff_date)
-            if skipped:
-                warnings.append(
-                    f"Recency filter: removed {skipped} row(s) with "
-                    f"'{date_col_name}' older than {cutoff_date.isoformat()} "
-                    f"({history_weeks}-week window)."
-                )
-        else:
-            # CW-number fallback
-            keep_mask = pd.Series(True, index=df.index)
-            for idx in df.index:
-                cells = [_cell_str(v) for v in df.loc[idx].values]
-                if _is_stale_by_cw(cells, week, history_weeks):
-                    keep_mask[idx] = False
-            skipped = int((~keep_mask).sum())
-            df = df[keep_mask]
-            if skipped:
-                warnings.append(
-                    f"Recency filter (CW fallback): removed {skipped} row(s) "
-                    f"with all CW references before CW{max(1, week - history_weeks)}."
-                )
 
     kept_rows = len(df)
     if kept_rows == 0:
         warnings.append(
             "No rows remain after recency filtering — "
-            "consider increasing history_weeks."
+            "check that the 'Last update' column has dates in the "
+            "current or previous month."
         )
 
     # ── Build pipe-delimited text table ──────────────────────────────
@@ -829,16 +831,16 @@ async def parse_gfd_with_llm(
     filepath: str,
     llm_config: dict,
     session_id: str,
-    history_weeks: int = 4,
+    history_weeks: int = 4,       # accepted for API compat; not used
     glossary_context: str = "",
 ) -> dict:
     """
     Full two-stage GFD parsing pipeline.
 
-    Stage 1: pandas-based Excel → filtered text table
+    Stage 1: pandas-based Excel → filtered text table (current + previous month)
     Stage 2: LLM text table → structured JSON
 
     Returns the LLM-extracted JSON dict (see _EXTRACT_SYSTEM for full schema).
     """
-    stage1 = excel_to_text_table(filepath, history_weeks=history_weeks)
+    stage1 = excel_to_text_table(filepath)
     return await llm_extract_gfd_data(stage1, llm_config, session_id, glossary_context)

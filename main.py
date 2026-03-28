@@ -480,16 +480,20 @@ async def upload_gfd(file: UploadFile = File(...), history_weeks: int = Form(4))
     # ── Build response with full extracted data for review ────────────
     meta = extracted.get("_meta", {})
 
+    # Build a clean copy of the extracted JSON for frontend display
+    # (exclude internal _meta, keep everything the LLM produced)
+    extracted_for_display = {k: v for k, v in extracted.items() if k != "_meta"}
+
     return {
         "session_id": session_id,
         "filename": file.filename,
         "current_cw": extracted.get("current_cw", ""),
         "total_rows_in_file": meta.get("total_rows_in_file", 0),
         "rows_after_filter": meta.get("rows_after_filter", 0),
-        "history_weeks": history_weeks,
         "product_groups": extracted.get("product_groups", []),
         "extraction_notes": extracted.get("extraction_notes", ""),
         "warnings": extracted.get("warnings", []),
+        "extracted_json": extracted_for_display,
     }
 
 
