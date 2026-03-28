@@ -1,22 +1,23 @@
 """
 GFD LLM Parser
 ==============
-Two-stage pipeline that replaces the deterministic gfd_excel_parser for content extraction.
+Two-stage pipeline for extracting structured data from Dashboard_Update Excel files.
 
-Stage 1 — Minimal deterministic read (the ONLY deterministic part):
+Stage 1 — Pandas-based deterministic extraction:
   • Open the workbook and find the Dashboard_Update sheet
-  • Detect the header row via keyword scoring (scans up to 60 rows, merge-aware)
-  • Resolve merged cells so repeated group values appear in every row
-  • Convert all rows to a pipe-delimited text table
-  • Filter stale rows using the "Last updated" date column (preferred) — any
-    common date format is handled; openpyxl native datetime objects are used
-    directly when available, strings are tried against multiple format patterns.
-    Falls back to CW-number scanning if no date column can be identified.
+  • Detect the header row via anchor-based scoring (robust to title rows,
+    logos, merged headers, and multi-row header bands)
+  • Extract a clean DataFrame with deduplicated column names
+  • Forward-fill merged-cell columns (product groups, regions, etc.)
+  • Compact individual customer flag columns into a single text column
+  • Filter stale rows using the "Last update" date column (preferred) —
+    falls back to CW-number scanning if no date column is found
+  • Convert the filtered DataFrame to a pipe-delimited text table
 
 Stage 2 — LLM extraction:
   • Send the filtered text table to the LLM
-  • LLM understands column semantics, infers product-family groupings
-    (repeated values from formerly-merged cells), and returns a precise JSON object
+  • LLM understands column semantics, infers product-family groupings,
+    and returns a precise JSON object
   • No brittle column-name fuzzy matching; no schema hard-coding
 
 The output JSON is the single source of truth consumed by gfd_llm_slides.py.
@@ -31,6 +32,8 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pandas as pd
 import openpyxl
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -54,207 +57,383 @@ def _create_llm(config: dict, max_tokens: int = 64000) -> AzureChatOpenAI:
         azure_endpoint=config["azure_endpoint"],
         api_key=config["api_key"],
         api_version=config.get("api_version", "2024-12-01-preview"),
-        #temperature=0.0,   # extraction must be deterministic
         max_tokens=max_tokens,
     )
 
 
-# ─── Stage 1: Excel → filtered pipe-delimited text table ─────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  Stage 1: Pandas-based Excel → filtered pipe-delimited text table
+# ═══════════════════════════════════════════════════════════════════════
 
-_HEADER_KEYWORDS = {
-    "plant", "product", "family", "coverage", "customer", "supplier",
-    "root", "cause", "action", "comment", "mitigation", "risk", "cw", "kw",
-    "constraint", "freight", "recovery", "fulfil", "fulfillment",
-    "region", "component", "allocation", "informed", "task", "force",
-}
+# ─── Pandas extractor (adapted from gfd_extractor_script.py) ─────────
 
-
-def _cell_str(value: Any) -> str:
-    """Normalise an openpyxl cell value to a clean string.
-
-    Also strips a leading apostrophe character: in some Excel files (including
-    the standard GFD template) cell values are stored with a literal leading
-    apostrophe that was used as a text-prefix escape marker.  openpyxl reads
-    this as part of the value string, so we remove it here.
-    """
-    if value is None:
+def _normalize_cell(x) -> str:
+    """Normalize a single cell value for header detection."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return ""
-    if isinstance(value, datetime):
-        return value.strftime("%d.%m.%Y")
-    s = re.sub(r"[\r\n]+", " ", str(value).strip())
-    # Strip leading/trailing apostrophe(s) that Excel text-prefix escape leaves behind.
-    # The standard GFD template stores all cell values as 'value' with surrounding quotes.
-    if s.startswith("'") or s.endswith("'"):
-        s = s.strip("'").strip()
+    s = str(x).strip()
+    s = re.sub(r"\s+", " ", s)
     return s
 
 
-def _header_score(cells: list[str]) -> int:
-    """Return keyword-match score for a row being the header row."""
-    text = " ".join(cells).lower()
-    return sum(1 for kw in _HEADER_KEYWORDS if kw in text)
-
-
-def _find_header_row(ws, merge_map: dict | None = None, max_scan: int = 60) -> int:
+def _cellwise_map_dataframe(df: pd.DataFrame, func) -> pd.DataFrame:
     """
-    Return the 1-based row index of the best header-row candidate.
-
-    Scans up to `max_scan` rows (default 60 — enough for any realistic title
-    block, logo row, or instruction section above the actual data header).
-
-    Uses the merge map when provided so that merged slave cells contribute
-    their master's value to the keyword score rather than scoring as empty.
-
-    Falls back to row 1 only when no row scores above zero (completely
-    blank or unrecognisable sheet).
+    Safe element-wise map that works across pandas versions.
+    Tries DataFrame.map (pandas ≥ 2.1), then applymap (classic),
+    then numpy fallback.
     """
-    if merge_map is None:
-        merge_map = {}
-
-    max_col = ws.max_column or 1
-    max_row = ws.max_row or 1
-    best_idx, best_score = 1, 0
-
-    for row_idx in range(1, min(max_scan + 1, max_row + 1)):
-        cells = []
-        for col_idx in range(1, max_col + 1):
-            raw = merge_map.get((row_idx, col_idx), ws.cell(row_idx, col_idx).value)
-            cells.append(_cell_str(raw))
-        score = _header_score(cells)
-        if score > best_score:
-            best_score, best_idx = score, row_idx
-
-    return best_idx
+    if hasattr(df, "map") and callable(getattr(df, "map")):
+        try:
+            return df.map(func)
+        except Exception:
+            pass
+    if hasattr(df, "applymap") and callable(getattr(df, "applymap")):
+        try:
+            return df.applymap(func)
+        except Exception:
+            pass
+    vals = df.to_numpy()
+    vfunc = np.vectorize(func, otypes=[object])
+    out = vfunc(vals)
+    return pd.DataFrame(out, index=df.index, columns=df.columns)
 
 
-def _build_merge_map(ws) -> dict[tuple[int, int], Any]:
+# Default anchor terms expected in the GFD template header row.
+_DEFAULT_ANCHORS = [
+    "Customer affected",
+    "Region",
+    "Plant / Location",
+    "Root Cause",
+    "Action / Comment",
+    "Task Force Leader",
+    "Last update",
+]
+
+
+def _extract_dashboard_dataframe(
+    xlsx_path: str,
+    sheet_name: str = "Dashboard_Update",
+    required_anchors: list[str] | None = None,
+    min_header_hits: int = 2,
+    min_non_empty_in_header: int = 8,
+    stop_when_blank_streak: int = 20,
+) -> tuple[pd.DataFrame, int]:
     """
-    Map every merged slave cell (row, col) → the master cell's value.
-    This is the core fix for product-group grouping: formerly-merged cells
-    now carry the group value in every row, letting the LLM see the grouping.
+    Extract a clean DataFrame from a Dashboard_Update-style Excel sheet.
+
+    Uses anchor-based scoring to detect the header row, handles duplicate
+    and blank column names, trims trailing blank rows, and normalises
+    whitespace in text cells.
+
+    Returns
+    -------
+    (df, header_row_idx) where df has clean column names and body data.
     """
-    merge_map: dict[tuple[int, int], Any] = {}
-    try:
-        for merge in ws.merged_cells.ranges:
-            master_val = ws.cell(merge.min_row, merge.min_col).value
-            for r in range(merge.min_row, merge.max_row + 1):
-                for c in range(merge.min_col, merge.max_col + 1):
-                    if (r, c) != (merge.min_row, merge.min_col):
-                        merge_map[(r, c)] = master_val
-    except Exception:
-        pass  # read_only mode has no merged_cells; fall back gracefully
-    return merge_map
+    if required_anchors is None:
+        required_anchors = _DEFAULT_ANCHORS
+
+    raw = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, engine="openpyxl")
+    norm = _cellwise_map_dataframe(raw, _normalize_cell)
+
+    def row_score(row_values):
+        cells = [c for c in row_values if c]
+        if not cells:
+            return -1, 0, 0
+        anchors_lower = {a.lower() for a in required_anchors}
+        hits = sum(c.lower() in anchors_lower for c in cells)
+        non_empty = len(cells)
+        uniq_ratio = len(set(cells)) / max(1, len(cells))
+        numeric_like = sum(bool(re.fullmatch(r"[-+]?\d+(\.\d+)?", c)) for c in cells)
+        numeric_penalty = numeric_like / max(1, non_empty)
+        score = (hits * 10) + (non_empty * 0.5) + (uniq_ratio * 2) - (numeric_penalty * 5)
+        return score, hits, non_empty
+
+    best = (-1e9, None, None, None)
+    for idx in range(len(norm)):
+        score, hits, non_empty = row_score(list(norm.iloc[idx].values))
+        if hits >= min_header_hits and non_empty >= min_non_empty_in_header:
+            if score > best[0]:
+                best = (score, idx, hits, non_empty)
+
+    if best[1] is None:
+        non_empty_counts = norm.apply(lambda r: sum(bool(x) for x in r.values), axis=1)
+        header_row_idx = int(non_empty_counts.idxmax())
+    else:
+        header_row_idx = int(best[1])
+
+    # Build deduplicated headers from detected row
+    header = list(norm.iloc[header_row_idx].values)
+    cleaned_header: list[str] = []
+    seen: dict[str, int] = {}
+    for i, h in enumerate(header):
+        h = h.strip() if isinstance(h, str) else ""
+        if not h:
+            h = f"Unnamed_{i}"
+        key = h.lower()
+        if key in seen:
+            seen[key] += 1
+            h = f"{h}__{seen[key]}"
+        else:
+            seen[key] = 0
+        cleaned_header.append(h)
+
+    # Extract body below header row
+    body = raw.iloc[header_row_idx + 1:].copy()
+    body.columns = cleaned_header
+
+    # Drop fully-empty columns and rows
+    body = body.dropna(axis=1, how="all")
+    body = body.dropna(axis=0, how="all")
+
+    # Trim after a long blank streak
+    empty_streak = 0
+    keep_idx: list = []
+    for i, row in body.iterrows():
+        if row.isna().all():
+            empty_streak += 1
+        else:
+            empty_streak = 0
+        keep_idx.append(i)
+        if empty_streak >= stop_when_blank_streak:
+            keep_idx = keep_idx[:-stop_when_blank_streak]
+            break
+    body = body.loc[keep_idx].copy()
+
+    # Normalise whitespace in string columns
+    for col in body.columns:
+        if body[col].dtype == object:
+            body[col] = body[col].apply(
+                lambda x: re.sub(r"\s+", " ", str(x)).strip() if pd.notna(x) else x
+            )
+
+    return body, header_row_idx
 
 
-# ─── Staleness filtering ─────────────────────────────────────────────
+# ─── Sheet-name detection ────────────────────────────────────────────
 
-# Substrings that identify the "Last updated" column (lower-cased, order matters).
+def _detect_dashboard_sheet(xlsx_path: str) -> tuple[str, list[str]]:
+    """
+    Find the best sheet name matching 'Dashboard_Update'.
+
+    Opens the workbook in read-only mode briefly, returns (sheet_name, warnings).
+    """
+    warnings: list[str] = []
+    wb = openpyxl.load_workbook(xlsx_path, read_only=True)
+    names = wb.sheetnames
+    wb.close()
+
+    # Exact substring match: "dashboard" AND "update"
+    for name in names:
+        n = name.lower()
+        if "dashboard" in n and "update" in n:
+            return name, warnings
+
+    # Partial match
+    for name in names:
+        if "dashboard" in name.lower() or "update" in name.lower():
+            return name, warnings
+
+    # Fallback: first sheet
+    warnings.append(f"'Dashboard_Update' sheet not found; using '{names[0]}'")
+    return names[0], warnings
+
+
+# ─── Forward-fill merged-cell columns ────────────────────────────────
+
+# Keywords that identify columns likely to originate from vertically
+# merged cells (product groups, regions, etc.).
+_FFILL_COL_KEYWORDS = [
+    "product", "family", "gruppe", "group", "component", "region",
+]
+
+
+def _forward_fill_merged_columns(df: pd.DataFrame) -> None:
+    """
+    Forward-fill columns whose header name suggests they were merged
+    in the original Excel (e.g. product group, region).
+
+    Modifies the DataFrame in place.
+    """
+    for col in df.columns:
+        lowered = col.lower()
+        if any(kw in lowered for kw in _FFILL_COL_KEYWORDS):
+            df[col] = df[col].ffill()
+
+
+# ─── Customer column compaction ──────────────────────────────────────
+
+# Tokens that indicate a cell is "not affected" (case-insensitive).
+_CUST_NEGATIVE = {"", "n", "no", "0", "-", "·", "false", "nan", "none"}
+
+
+def _compact_customer_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """
+    Detect and compact individual customer-flag columns into a single
+    "Customers affected" text column.
+
+    Detection heuristic: find a contiguous block of ≥ 5 columns where
+    > 70 % of non-NaN values are single-character flags (X, Y, N, …) or
+    empty strings.  These are the per-customer flag columns present in
+    the standard GFD template (typically 32 columns, one per OEM).
+
+    Returns (df, was_compacted).
+    """
+    flag_col_indices: list[int] = []
+
+    for i, col in enumerate(df.columns):
+        vals = df[col].dropna().astype(str).str.strip().str.lower()
+        if len(vals) == 0:
+            # Entirely empty column — could be part of the customer block
+            flag_col_indices.append(i)
+            continue
+        flag_like = vals.apply(lambda v: len(v) <= 1 or v in _CUST_NEGATIVE)
+        if flag_like.mean() >= 0.70:
+            flag_col_indices.append(i)
+
+    if len(flag_col_indices) < 5:
+        return df, False
+
+    # Find longest contiguous run among the flagged indices
+    runs: list[tuple[int, int]] = []
+    start = flag_col_indices[0]
+    prev = start
+    for idx in flag_col_indices[1:]:
+        if idx == prev + 1:
+            prev = idx
+        else:
+            runs.append((start, prev))
+            start = idx
+            prev = idx
+    runs.append((start, prev))
+
+    longest = max(runs, key=lambda r: r[1] - r[0] + 1)
+    span = longest[1] - longest[0] + 1
+    if span < 5:
+        return df, False
+
+    start_idx, end_idx = longest
+    customer_col_names = list(df.columns[start_idx : end_idx + 1])
+
+    # Build the compacted value per row
+    def _compact_row(row):
+        affected: list[str] = []
+        for cname in customer_col_names:
+            val = str(row.get(cname, "")).strip().lower()
+            if val and val not in _CUST_NEGATIVE:
+                affected.append(cname)
+        return ", ".join(affected)
+
+    compacted_vals = df.apply(_compact_row, axis=1)
+
+    # Rebuild DataFrame: columns before | Customers affected | columns after
+    cols_before = list(df.columns[:start_idx])
+    cols_after = list(df.columns[end_idx + 1 :])
+
+    new_df = df[cols_before].copy()
+    new_df["Customers affected"] = compacted_vals.values
+    for c in cols_after:
+        new_df[c] = df[c].values
+
+    return new_df, True
+
+
+# ─── Date-based staleness filtering ──────────────────────────────────
+
+# Substrings that identify the "Last updated" column (lower-cased).
 _DATE_COL_HINTS = [
     "last update", "last änderung", "last change", "aktualisiert",
     "updated", "update date", "datum", "date",
 ]
 
-# Date format strings tried in order when the cell value is a plain string.
-# Covers the most common lazy-entry styles seen in German/European supply-chain Excel files.
+# Date format strings tried in order when the cell value is a string.
 _DATE_FORMATS = [
-    "%d.%m.%Y",   # 15.03.2026  (European standard)
-    "%d.%m.%y",   # 15.03.26
-    "%d/%m/%Y",   # 15/03/2026
-    "%d/%m/%y",   # 15/03/26
-    "%m/%d/%Y",   # 03/15/2026  (US style, less common)
-    "%m/%d/%y",   # 03/15/26
-    "%Y-%m-%d",   # 2026-03-15  (ISO)
-    "%d-%m-%Y",   # 15-03-2026
-    "%d %b %Y",   # 15 Mar 2026
-    "%d %B %Y",   # 15 March 2026
-    "%b %d, %Y",  # Mar 15, 2026
-    "%B %d, %Y",  # March 15, 2026
-    "%d.%m",      # 15.03  (no year → current year assumed)
-    "%d/%m",      # 15/03  (no year → current year assumed)
+    "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y",
+    "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d-%m-%Y",
+    "%d %b %Y", "%d %B %Y", "%b %d, %Y", "%B %d, %Y",
+    "%d.%m", "%d/%m",
 ]
 
 
-def _find_date_col(headers: list[str]) -> int | None:
-    """
-    Return the 0-based index of the "Last updated" column, or None if not found.
-    Checks for substring matches against _DATE_COL_HINTS in priority order.
-    """
-    lowered = [h.lower().replace("\n", " ").strip() for h in headers]
+def _find_date_column(columns: list[str]) -> str | None:
+    """Return the column name matching a 'Last updated' hint, or None."""
     for hint in _DATE_COL_HINTS:
-        for i, h in enumerate(lowered):
-            if hint in h:
-                return i
+        for col in columns:
+            if hint in col.lower().replace("\n", " ").strip():
+                return col
     return None
 
 
 def _parse_date_value(raw: Any) -> date | None:
     """
-    Convert a raw openpyxl cell value to a Python date.
+    Convert a raw cell value to a Python date.
 
-    openpyxl returns proper Excel date cells as datetime objects already.
-    Lazily-typed strings are tried against _DATE_FORMATS. Returns None if
-    unparseable (caller should keep the row).
+    Handles: datetime/date objects, pandas Timestamps, Excel serial
+    numbers (float/int), and string values in common European/US formats.
+    Returns None when unparseable.
     """
-    from datetime import date as _date, timedelta as _td
-
-    if raw is None:
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
         return None
-
-    # openpyxl native datetime / date (most reliable path)
+    if isinstance(raw, pd.Timestamp):
+        return raw.date()
     if isinstance(raw, datetime):
         return raw.date()
-    if isinstance(raw, _date):
+    if isinstance(raw, date):
         return raw
 
-    # Numeric: Excel stores dates as serial numbers; openpyxl normally converts
-    # them, but with data_only=True on some files they may arrive as floats.
+    # Excel serial date (float/int left un-converted by the engine)
     if isinstance(raw, (int, float)):
         try:
-            # Excel epoch: 1900-01-00 (with the off-by-two leap-year bug)
-            base = _date(1899, 12, 30)
-            return base + _td(days=int(raw))
+            base = date(1899, 12, 30)
+            return base + timedelta(days=int(raw))
         except (ValueError, OverflowError):
             return None
 
-    # String — try all known formats
+    # String → try known formats
     s = str(raw).strip()
     if not s:
         return None
-
-    # Remove weekday prefixes like "Mon, ", "Mo. " etc.
-    s = re.sub(r"^[A-Za-z]{2,3}[,.\s]+", "", s).strip()
-
+    s = re.sub(r"^[A-Za-z]{2,3}[,.\s]+", "", s).strip()   # "Mon, " prefix
     current_year = datetime.now().year
+
     for fmt in _DATE_FORMATS:
         try:
             dt = datetime.strptime(s, fmt)
-            # If the format has no year component, attach current year
             if "%Y" not in fmt and "%y" not in fmt:
                 dt = dt.replace(year=current_year)
             return dt.date()
         except ValueError:
             continue
+    return None
 
-    return None  # unparseable → caller keeps the row
 
-
-def _is_stale_by_date(raw_date_val: Any, cutoff: date) -> bool:
+def _filter_stale_rows(
+    df: pd.DataFrame,
+    date_col: str,
+    cutoff: date,
+) -> tuple[pd.DataFrame, int]:
     """
-    Return True if the parsed date is strictly before cutoff.
-    Returns False (keep) when the value is None / unparseable.
-    """
-    from datetime import date as _date
-    parsed = _parse_date_value(raw_date_val)
-    if parsed is None:
-        return False           # can't read the date → benefit of the doubt
-    return parsed < cutoff
+    Remove rows whose date_col value is strictly before cutoff.
 
+    Rows where the date is unparseable are KEPT (benefit of the doubt).
+    Returns (filtered_df, num_removed).
+    """
+    keep_mask = pd.Series(True, index=df.index)
+    for idx in df.index:
+        raw = df.at[idx, date_col]
+        parsed = _parse_date_value(raw)
+        if parsed is not None and parsed < cutoff:
+            keep_mask[idx] = False
+
+    filtered = df[keep_mask]
+    return filtered, int((~keep_mask).sum())
+
+
+# ─── CW-number fallback staleness ────────────────────────────────────
 
 def _is_stale_by_cw(cells: list[str], current_week: int, history_weeks: int) -> bool:
     """
     Fallback: return True only when the row contains CW/KW references AND
     every one of them is older than (current_week − history_weeks).
-    Rows with no CW references are kept (benefit of the doubt).
     """
     cutoff_week = current_week - history_weeks
     row_text = " ".join(cells)
@@ -264,70 +443,25 @@ def _is_stale_by_cw(cells: list[str], current_week: int, history_weeks: int) -> 
     return all(n < cutoff_week for n in cw_nums)
 
 
-def _find_customer_col_range(ws) -> tuple[int, int] | None:
-    """
-    Return the (start_col_idx, end_col_idx) range (0-based, inclusive) of the
-    individual customer-name columns, identified by a merged super-header cell
-    whose value contains both "customer" and "affect" (e.g. "Customer affected").
+# ─── Text table builder ─────────────────────────────────────────────
 
-    Returns None if no such merged range is found.
-    """
-    try:
-        for merge in ws.merged_cells.ranges:
-            master_val = ws.cell(merge.min_row, merge.min_col).value or ""
-            lowered = str(master_val).lower()
-            if "customer" in lowered and "affect" in lowered:
-                return (merge.min_col - 1, merge.max_col - 1)   # convert to 0-based
-    except Exception:
-        pass
-    return None
-
-
-def _compact_customer_cols(
-    headers: list[str],
-    rows: list[list[str]],
-    cust_range: tuple[int, int] | None,
-) -> tuple[list[str], list[list[str]]]:
-    """
-    Collapse the individual customer columns (W–BB in the standard template)
-    into a single synthetic column called "Customers affected".
-
-    For each data row the customer columns that carry a non-empty, non-"N"
-    value are collected; their header names become a comma-separated list.
-    This reduces a 64-column table to ~33 columns and makes the LLM prompt
-    far more readable.
-
-    If cust_range is None the headers and rows are returned unchanged.
-    """
-    if cust_range is None:
-        return headers, rows
-
-    start, end = cust_range
-    customer_names = headers[start : end + 1]   # names of each customer column
-
-    new_headers = headers[:start] + ["Customers affected"] + headers[end + 1 :]
-
-    new_rows: list[list[str]] = []
-    for row in rows:
-        affected: list[str] = []
-        for rel_i, cname in enumerate(customer_names):
-            col_i = start + rel_i
-            if col_i >= len(row):
-                break
-            val = row[col_i].strip()
-            # Any non-empty, non-negative-looking value counts as "affected"
-            if val and val.lower() not in ("", "n", "no", "0", "-", "·", "false"):
-                affected.append(cname)
-        customers_str = ", ".join(affected) if affected else ""
-        tail = row[end + 1 :] if end + 1 < len(row) else []
-        new_rows.append(row[:start] + [customers_str] + tail)
-
-    return new_headers, new_rows
+def _cell_str(value: Any) -> str:
+    """Convert a DataFrame cell value to a clean string for the text table."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y")
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%d.%m.%Y")
+    s = re.sub(r"[\r\n]+", " ", str(value).strip())
+    # Strip leading/trailing apostrophes (Excel text-prefix escape)
+    if s.startswith("'") or s.endswith("'"):
+        s = s.strip("'").strip()
+    return s
 
 
 def _build_text_table(headers: list[str], rows: list[list[str]]) -> str:
     """Render headers + rows as a compact pipe-delimited markdown table."""
-    # Cap column display width so the table stays manageable
     MAX_COL_W = 500
     col_widths = [min(max(len(h), 4), MAX_COL_W) for h in headers]
     for row in rows:
@@ -347,196 +481,150 @@ def _build_text_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+# ─── Main Stage 1 entry point ───────────────────────────────────────
+
 def excel_to_text_table(filepath: str, history_weeks: int = 4) -> dict:
     """
     Stage 1 (deterministic): Open the Excel workbook and produce a
     pipe-delimited text table with stale rows removed.
 
-    Staleness is determined by the "Last updated" column (preferred): any row
-    whose date is older than (today − history_weeks) is dropped. If no date
-    column is identified, falls back to scanning rows for CW/KW references.
+    Uses the pandas-based extractor for robust header detection and
+    data extraction, then applies date filtering and customer column
+    compaction before building the text table.
 
     Returns
     -------
     {
-      text_table      : pipe-delimited table string (headers + data rows)
-      headers         : list of column header strings
-      current_cw      : "CW{week}/{year}"
-      total_rows      : row count before filtering
-      kept_rows       : row count after filtering
-      sheet_used      : actual sheet name
-      date_col_name   : header of the detected date column, or None
-      warnings        : list of warning strings
+      text_table          : pipe-delimited table string
+      headers             : list of column header strings
+      original_headers    : headers before compaction
+      current_cw          : "CW{week}/{year}"
+      total_rows          : row count before filtering
+      kept_rows           : row count after filtering
+      sheet_used          : actual sheet name
+      date_col_name       : header of the detected date column, or None
+      customer_col_range  : None (legacy field, kept for compatibility)
+      csv_path            : path to the extracted CSV (before filtering), or None
+      warnings            : list of warning strings
     }
     """
-    warnings: list[str] = []
     year, week = _get_current_cw()
     current_cw = f"CW{week}/{year}"
 
-    # ── Open workbook (not read_only so merged_cells works) ──────────
-    wb = openpyxl.load_workbook(filepath, data_only=True)
+    # ── Detect sheet name ────────────────────────────────────────────
+    sheet_used, warnings = _detect_dashboard_sheet(filepath)
 
-    # ── Locate the Dashboard_Update sheet ────────────────────────────
-    sheet_used: str | None = None
-    for name in wb.sheetnames:
-        n = name.lower()
-        if "dashboard" in n and "update" in n:
-            sheet_used = name
-            break
-    if not sheet_used:
-        for name in wb.sheetnames:
-            if "dashboard" in name.lower() or "update" in name.lower():
-                sheet_used = name
-                break
-    if not sheet_used:
-        sheet_used = wb.sheetnames[0]
-        warnings.append(f"'Dashboard_Update' sheet not found; using '{sheet_used}'")
+    # ── Extract clean DataFrame using pandas-based extractor ─────────
+    try:
+        df, header_idx = _extract_dashboard_dataframe(filepath, sheet_name=sheet_used)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to extract DataFrame from sheet '{sheet_used}': {exc}"
+        ) from exc
 
-    ws = wb[sheet_used]
+    original_headers = list(df.columns)
+    total_rows = len(df)
 
-    # ── Build merge map before anything else ─────────────────────────
-    merge_map = _build_merge_map(ws)
+    if total_rows == 0:
+        warnings.append("No data rows found below the detected header row.")
 
-    def cell_val(row: int, col: int) -> Any:
-        return merge_map.get((row, col), ws.cell(row, col).value)
+    # ── Forward-fill columns that were merged in Excel ───────────────
+    _forward_fill_merged_columns(df)
 
-    max_col = ws.max_column or 1
-    max_row = ws.max_row or 1
+    # ── Write extracted CSV (full dataset before any filtering) ──────
+    #    This is the clean intermediate artifact: messy Excel → tidy CSV.
+    #    Downstream filtering and compaction operate on the DataFrame
+    #    in memory, but this CSV is saved alongside the uploaded file so
+    #    the user can inspect / debug the extraction independently.
+    csv_path = str(Path(filepath).with_suffix(".csv"))
+    try:
+        df.to_csv(csv_path, index=False)
+        warnings.append(f"Extracted CSV saved: {csv_path}")
+    except Exception as csv_exc:
+        warnings.append(f"Could not save extracted CSV: {csv_exc}")
+        csv_path = None
 
-    # ── Detect header row (merge-aware, scans up to 60 rows) ─────────
-    hdr_idx = _find_header_row(ws, merge_map=merge_map)
+    # ── Compact individual customer columns → single text column ─────
+    df, was_compacted = _compact_customer_columns(df)
+    if was_compacted:
+        n_compacted = len(original_headers) - len(df.columns) + 1
+        warnings.append(
+            f"Compacted {n_compacted} individual customer columns into "
+            f"'Customers affected'."
+        )
 
-    # ── Score the row immediately below the header to decide whether it
-    #    is a genuine sub-header continuation (e.g. a second header row
-    #    with units or sub-labels) or the first data row.
-    #    Only combine when the next row itself scores as header-like (≥ 2).
-    #    This prevents absorbing data values (e.g. supplier names in the
-    #    first data row) into column header strings.
-    next_row_raw = [
-        _cell_str(cell_val(hdr_idx + 1, c))
-        for c in range(1, min(max_col, 60) + 1)
-    ] if hdr_idx + 1 <= max_row else []
-    next_row_is_subhdr = _header_score(next_row_raw) >= 2
+    # ── Filter stale rows ────────────────────────────────────────────
+    date_col_name = _find_date_column(list(df.columns))
 
-    # ── Extract headers ───────────────────────────────────────────────
-    headers: list[str] = []
-    for col in range(1, max_col + 1):
-        top = _cell_str(cell_val(hdr_idx, col))
-        if next_row_is_subhdr:
-            bot = next_row_raw[col - 1] if col - 1 < len(next_row_raw) else ""
-            # Combine only when bot adds new information
-            if bot and bot != top and not re.search(r"\d{2}\.\d{2}\.\d{4}", bot) \
-                    and bot.lower() not in ("y", "n", "yes", "no"):
-                combined = f"{top} {bot}".strip()
-            else:
-                combined = top
-        else:
-            combined = top
-        headers.append(combined)
-
-    # Trim trailing empty headers
-    while headers and not headers[-1]:
-        headers.pop()
-    max_col = len(headers)
-
-    # data starts on the row after the (possibly two-row) header band
-    data_start = hdr_idx + 2 if next_row_is_subhdr else hdr_idx + 1
-
-    # ── Detect customer column range (from merged "Customer affected" super-header) ──
-    cust_range = _find_customer_col_range(ws)
-
-    # ── Detect "Last updated" column ─────────────────────────────────
-    date_col_idx: int | None = _find_date_col(headers)
-    date_col_name: str | None = headers[date_col_idx] if date_col_idx is not None else None
     if date_col_name:
-        warnings.append(f"Recency filter: using '{date_col_name}' column for date-based filtering.")
+        warnings.append(
+            f"Recency filter: using '{date_col_name}' column for date-based filtering."
+        )
     else:
-        warnings.append("Recency filter: no 'Last updated' column found — falling back to CW-number scanning.")
+        warnings.append(
+            "Recency filter: no 'Last updated' column found — "
+            "falling back to CW-number scanning."
+        )
 
-    # ── Extract and clean data rows ───────────────────────────────────
-    # Each entry is (stringified_cells, raw_date_value) so we can filter
-    # on the native openpyxl value (datetime object or raw string) before
-    # discarding it.
-    all_rows: list[tuple[list[str], Any]] = []
-    for row_idx in range(data_start, max_row + 1):
-        raw_cells = [cell_val(row_idx, col) for col in range(1, max_col + 1)]
-        cells = [_cell_str(v) for v in raw_cells]
+    if history_weeks > 0:
+        cutoff_date = date.today() - timedelta(weeks=history_weeks)
 
-        # Skip empty rows
-        if not any(cells):
-            continue
-        # Skip separator rows (---, ===, etc.)
-        non_empty = [c for c in cells if c]
-        if all(re.match(r"^[-=_\s]+$", c) for c in non_empty):
-            continue
-        # Skip rows with fewer than 3 non-empty cells (spacers / subtotals)
-        if len(non_empty) < 3:
-            continue
-
-        # Extract raw date value before stringification is lost
-        raw_date = raw_cells[date_col_idx] if date_col_idx is not None and date_col_idx < len(raw_cells) else None
-        all_rows.append((cells[:max_col], raw_date))
-
-    wb.close()
-
-    total_rows = len(all_rows)
-    cutoff_date = date.today() - timedelta(weeks=history_weeks)
-
-    # ── Filter stale rows ─────────────────────────────────────────────
-    kept: list[list[str]] = []
-    skipped = 0
-
-    for cells, raw_date in all_rows:
-        if date_col_idx is not None:
-            # Primary: date-column comparison
-            if _is_stale_by_date(raw_date, cutoff_date):
-                skipped += 1
-            else:
-                kept.append(cells)
+        if date_col_name:
+            df, skipped = _filter_stale_rows(df, date_col_name, cutoff_date)
+            if skipped:
+                warnings.append(
+                    f"Recency filter: removed {skipped} row(s) with "
+                    f"'{date_col_name}' older than {cutoff_date.isoformat()} "
+                    f"({history_weeks}-week window)."
+                )
         else:
-            # Fallback: CW-number scan
-            if _is_stale_by_cw(cells, week, history_weeks):
-                skipped += 1
-            else:
-                kept.append(cells)
+            # CW-number fallback
+            keep_mask = pd.Series(True, index=df.index)
+            for idx in df.index:
+                cells = [_cell_str(v) for v in df.loc[idx].values]
+                if _is_stale_by_cw(cells, week, history_weeks):
+                    keep_mask[idx] = False
+            skipped = int((~keep_mask).sum())
+            df = df[keep_mask]
+            if skipped:
+                warnings.append(
+                    f"Recency filter (CW fallback): removed {skipped} row(s) "
+                    f"with all CW references before CW{max(1, week - history_weeks)}."
+                )
 
-    if skipped:
-        if date_col_idx is not None:
-            warnings.append(
-                f"Recency filter: removed {skipped} row(s) with '{date_col_name}' "
-                f"older than {cutoff_date.isoformat()} ({history_weeks}-week window)."
-            )
-        else:
-            warnings.append(
-                f"Recency filter (CW fallback): removed {skipped} row(s) with all "
-                f"CW references before CW{max(1, week - history_weeks)}."
-            )
-    if not kept:
-        warnings.append("No rows remain after recency filtering — consider increasing history_weeks.")
+    kept_rows = len(df)
+    if kept_rows == 0:
+        warnings.append(
+            "No rows remain after recency filtering — "
+            "consider increasing history_weeks."
+        )
 
-    # ── Compact the 32 individual customer columns → one synthetic column ──
-    #    This reduces table width from 64 → ~33 columns, keeping the LLM
-    #    prompt manageable. The actual customer names become a comma-separated
-    #    value when they are marked as affected in the row.
-    compacted_headers, kept = _compact_customer_cols(headers, kept, cust_range)
+    # ── Build pipe-delimited text table ──────────────────────────────
+    headers = list(df.columns)
+    rows: list[list[str]] = []
+    for _, row in df.iterrows():
+        rows.append([_cell_str(v) for v in row.values])
 
-    text_table = _build_text_table(compacted_headers, kept)
+    text_table = _build_text_table(headers, rows)
 
     return {
-        "text_table":     text_table,
-        "headers":        compacted_headers,
-        "original_headers": headers,
-        "current_cw":     current_cw,
-        "total_rows":     total_rows,
-        "kept_rows":      len(kept),
-        "sheet_used":     sheet_used,
-        "date_col_name":  date_col_name,
-        "customer_col_range": cust_range,
-        "warnings":       warnings,
+        "text_table":         text_table,
+        "headers":            headers,
+        "original_headers":   original_headers,
+        "current_cw":         current_cw,
+        "total_rows":         total_rows,
+        "kept_rows":          kept_rows,
+        "sheet_used":         sheet_used,
+        "date_col_name":      date_col_name,
+        "customer_col_range": None,    # legacy field kept for Stage 2 compat
+        "csv_path":           csv_path,
+        "warnings":           warnings,
     }
 
 
-# ─── Stage 2: LLM extraction ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  Stage 2: LLM extraction  (unchanged)
+# ═══════════════════════════════════════════════════════════════════════
 
 _EXTRACT_SYSTEM = """\
 You are a supply chain data extraction specialist for an automotive parts manufacturer.
@@ -695,6 +783,7 @@ async def llm_extract_gfd_data(
             "sheet_used": stage1["sheet_used"],
             "date_col_name": stage1.get("date_col_name"),
             "customer_col_range": stage1.get("customer_col_range"),
+            "csv_path": stage1.get("csv_path"),
         }
         return extracted
 
@@ -729,6 +818,7 @@ def _extraction_fallback(stage1: dict, error_msg: str) -> dict:
             "sheet_used": stage1["sheet_used"],
             "date_col_name": stage1.get("date_col_name"),
             "customer_col_range": stage1.get("customer_col_range"),
+            "csv_path": stage1.get("csv_path"),
         },
     }
 
@@ -745,7 +835,7 @@ async def parse_gfd_with_llm(
     """
     Full two-stage GFD parsing pipeline.
 
-    Stage 1: deterministic Excel → filtered text table
+    Stage 1: pandas-based Excel → filtered text table
     Stage 2: LLM text table → structured JSON
 
     Returns the LLM-extracted JSON dict (see _EXTRACT_SYSTEM for full schema).
