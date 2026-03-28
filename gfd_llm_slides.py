@@ -59,7 +59,7 @@ TEMPLATE_PATH = Path(__file__).parent / "gfd_ppt_template.pptx"
 
 # ─── LLM factory ────────────────────────────────────────────────────
 
-def _create_llm(config: dict, max_tokens: int = 8192) -> AzureChatOpenAI:
+def _create_llm(config: dict, max_tokens: int = 64000) -> AzureChatOpenAI:
     return AzureChatOpenAI(
         azure_deployment=config["azure_deployment"],
         azure_endpoint=config["azure_endpoint"],
@@ -421,7 +421,7 @@ async def llm_generate_slide_spec(
 
     Returns a dict with a "rows" list.  Falls back to a deterministic spec on error.
     """
-    llm = _create_llm(llm_config, max_tokens=8192)
+    llm = _create_llm(llm_config, max_tokens=64000)
     t0 = time.time()
     today = date.today().isoformat()
     current_cw = extracted.get("current_cw", "CW??/????")

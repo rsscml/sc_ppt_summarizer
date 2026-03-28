@@ -824,7 +824,7 @@ _EXTRACT_USER = """\
 Current calendar week: {current_cw}
 Sheet name: {sheet_name}
 
-The table below contains EXACTLY {kept_rows} data rows (R001–R{kept_rows:03d}), filtered from {total_rows} total.
+The table below contains EXACTLY {kept_rows} data rows ({first_row_label}–{last_row_label}), filtered from {total_rows} total.
 Your JSON output MUST contain exactly {kept_rows} rows across all product_groups combined — no more, no fewer.
 Do NOT merge, skip, or summarise any rows even if they look similar.
 
@@ -839,29 +839,206 @@ def _count_extracted_rows(extracted: dict) -> int:
     )
 
 
+# ─── Chunked extraction ─────────────────────────────────────────────
+
+_CHUNK_SIZE = 5   # rows per LLM call — small enough for reliable extraction
+
+
+def _chunk_text_table(text_table: str, chunk_size: int = _CHUNK_SIZE,
+                      ) -> list[dict]:
+    """
+    Split a pipe-delimited text table into chunks of at most `chunk_size`
+    data rows, each retaining the original header and separator lines.
+
+    Returns a list of dicts:
+      { "text_table": str, "row_count": int,
+        "first_label": "R005", "last_label": "R014" }
+    """
+    lines = text_table.split("\n")
+    header_line = lines[0]       # | # | Product Group | ...
+    sep_line    = lines[1]       # |---|---| ...
+    data_lines  = lines[2:]      # | R001 | ... |
+
+    if not data_lines:
+        return [{"text_table": text_table, "row_count": 0,
+                 "first_label": "", "last_label": ""}]
+
+    chunks: list[dict] = []
+    for start in range(0, len(data_lines), chunk_size):
+        batch = data_lines[start : start + chunk_size]
+        chunk_table = "\n".join([header_line, sep_line] + batch)
+
+        # Extract row labels from the first column (e.g. "R001")
+        first_label = batch[0].split("|")[1].strip() if batch else ""
+        last_label  = batch[-1].split("|")[1].strip() if batch else ""
+
+        chunks.append({
+            "text_table": chunk_table,
+            "row_count":  len(batch),
+            "first_label": first_label,
+            "last_label":  last_label,
+        })
+
+    return chunks
+
+
+async def _extract_single_chunk(
+    chunk: dict,
+    stage1: dict,
+    llm: AzureChatOpenAI,
+    system_prompt: str,
+    session_id: str,
+    llm_config: dict,
+    chunk_idx: int,
+    total_chunks: int,
+) -> dict | None:
+    """
+    Send a single text-table chunk to the LLM and return the parsed JSON.
+    Returns None on failure (the caller will log and continue).
+    """
+    chunk_label = f"chunk {chunk_idx + 1}/{total_chunks}"
+    row_count  = chunk["row_count"]
+    first_lbl  = chunk["first_label"]
+    last_lbl   = chunk["last_label"]
+
+    user_msg = _EXTRACT_USER.format(
+        current_cw=stage1["current_cw"],
+        sheet_name=stage1["sheet_used"],
+        kept_rows=row_count,
+        total_rows=stage1["total_rows"],
+        first_row_label=first_lbl,
+        last_row_label=last_lbl,
+        text_table=chunk["text_table"],
+    )
+
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_msg),
+    ]
+
+    t0 = time.time()
+    try:
+        response = await llm.ainvoke(messages)
+        raw = response.content.strip()
+
+        # ── Dump raw response ────────────────────────────────────────
+        try:
+            csv_path = stage1.get("csv_path")
+            dump_dir = Path(csv_path).parent if csv_path else Path(".")
+            dump_path = dump_dir / f"{session_id}_llm_extract_{chunk_label.replace(' ', '_').replace('/', 'of')}_raw.txt"
+            dump_path.write_text(raw, encoding="utf-8")
+        except Exception:
+            pass
+
+        extracted = _parse_llm_json(raw, session_id=session_id, attempt=chunk_idx)
+
+        usage = response.response_metadata.get("token_usage", {})
+        completion_tokens = usage.get("completion_tokens", 0)
+        log_tokens(session_id, f"gfd_llm_extract_{chunk_label}", usage,
+                   llm_config.get("azure_deployment", ""))
+
+        n_rows_out = _count_extracted_rows(extracted)
+        duration = (time.time() - t0) * 1000
+
+        print(f"[GFD DEBUG] {chunk_label} ({first_lbl}–{last_lbl}): "
+              f"sent {row_count} rows → got {n_rows_out} rows back "
+              f"({completion_tokens} tokens, {duration:.0f}ms)")
+
+        if n_rows_out < row_count:
+            print(f"[GFD WARNING] {chunk_label}: lost {row_count - n_rows_out} rows")
+
+        log_trace(session_id, f"gfd_llm_extract_{chunk_label}",
+                  f"Input: {row_count} rows ({first_lbl}–{last_lbl})",
+                  f"Extracted {n_rows_out} rows", duration)
+
+        return extracted
+
+    except Exception as exc:
+        duration = (time.time() - t0) * 1000
+        print(f"[GFD ERROR] {chunk_label}: {str(exc)[:120]}")
+        log_trace(session_id, f"gfd_llm_extract_{chunk_label}",
+                  f"Input: {row_count} rows ({first_lbl}–{last_lbl})",
+                  f"ERROR: {str(exc)[:120]}", duration, {"error": True})
+        return None
+
+
+def _merge_extracted_chunks(
+    chunk_results: list[dict],
+    current_cw: str,
+    sheet_name: str,
+) -> dict:
+    """
+    Merge product_groups from multiple chunk extraction results.
+
+    Product groups with the same (product_family_code, product_family_desc)
+    pair are combined — their rows are concatenated in order.
+    """
+    # Use (code, desc) as the merge key to handle groups split across chunks
+    merged_groups: dict[tuple[str, str], dict] = {}
+    all_notes: list[str] = []
+    all_warnings: list[str] = []
+
+    for chunk_result in chunk_results:
+        if chunk_result is None:
+            continue
+
+        notes = chunk_result.get("extraction_notes", "")
+        if notes:
+            all_notes.append(notes)
+        for w in chunk_result.get("warnings", []):
+            if w not in all_warnings:
+                all_warnings.append(w)
+
+        for pg in chunk_result.get("product_groups", []):
+            code = pg.get("product_family_code", "")
+            desc = pg.get("product_family_desc", "")
+            key = (code, desc)
+
+            if key in merged_groups:
+                merged_groups[key]["rows"].extend(pg.get("rows", []))
+            else:
+                merged_groups[key] = {
+                    "product_family_code": code,
+                    "product_family_desc": desc,
+                    "rows": list(pg.get("rows", [])),
+                }
+
+    return {
+        "current_cw": current_cw,
+        "sheet_name": sheet_name,
+        "extraction_notes": "; ".join(all_notes) if all_notes else "",
+        "product_groups": list(merged_groups.values()),
+        "warnings": all_warnings,
+    }
+
+
+# ─── Main Stage 2 entry point ───────────────────────────────────────
+
 async def llm_extract_gfd_data(
     stage1: dict,
     llm_config: dict,
     session_id: str,
     glossary_context: str = "",
-    max_retries: int = 2,
+    chunk_size: int = _CHUNK_SIZE,
 ) -> dict:
     """
-    Stage 2 (LLM): Send the filtered text table to the LLM and extract structured JSON.
+    Stage 2 (LLM): Extract structured JSON from the filtered text table
+    using chunked extraction.
 
-    Validates that the number of output rows matches the input row count.
-    If the LLM drops more than 10 % of rows, retries with an explicit reminder.
+    The text table is split into batches of ~10 rows.  Each batch is sent
+    to the LLM independently.  Results are merged by product-group code,
+    so groups that span a chunk boundary are recombined automatically.
 
-    Returns the parsed extraction dict. On JSON parse failure, returns a minimal
-    fallback structure with the error noted in warnings.
+    This approach is far more reliable than single-shot extraction because
+    each LLM call handles a small, manageable number of rows.
     """
     input_rows = stage1["kept_rows"]
-    llm = _create_llm(llm_config, max_tokens=64000)
+    llm = _create_llm(llm_config, max_tokens=32000)
     t0 = time.time()
 
-    print(f"[GFD DEBUG] ═══ Stage 2: LLM extraction ═══")
+    print(f"\n[GFD DEBUG] ═══ Stage 2: LLM extraction (chunked, {chunk_size} rows/chunk) ═══")
     print(f"[GFD DEBUG] Input: {input_rows} data rows, "
-          f"{len(stage1['headers'])} columns, max_tokens=64000")
+          f"{len(stage1['headers'])} columns")
 
     glossary_block = (
         f"\n\nCOMPANY GLOSSARY — use these to expand abbreviations correctly:\n{glossary_context}"
@@ -888,153 +1065,88 @@ async def llm_extract_gfd_data(
             print(f"[GFD DEBUG] Could not save text table debug file: {e}")
             text_table_path = None
 
-    base_system = _EXTRACT_SYSTEM.format(glossary_block=glossary_block)
-    base_user = _EXTRACT_USER.format(
+    system_prompt = _EXTRACT_SYSTEM.format(glossary_block=glossary_block)
+
+    # ── Split into chunks ────────────────────────────────────────────
+    chunks = _chunk_text_table(stage1["text_table"], chunk_size=chunk_size)
+    total_chunks = len(chunks)
+    print(f"[GFD DEBUG] Split into {total_chunks} chunk(s): "
+          + ", ".join(f"{c['first_label']}–{c['last_label']} ({c['row_count']})"
+                      for c in chunks))
+
+    # ── Extract each chunk ───────────────────────────────────────────
+    chunk_results: list[dict | None] = []
+    total_rows_extracted = 0
+
+    for i, chunk in enumerate(chunks):
+        result = await _extract_single_chunk(
+            chunk, stage1, llm, system_prompt,
+            session_id, llm_config, chunk_idx=i, total_chunks=total_chunks,
+        )
+        chunk_results.append(result)
+        if result is not None:
+            total_rows_extracted += _count_extracted_rows(result)
+
+    # ── Merge results ────────────────────────────────────────────────
+    merged = _merge_extracted_chunks(
+        chunk_results,
         current_cw=stage1["current_cw"],
         sheet_name=stage1["sheet_used"],
-        kept_rows=stage1["kept_rows"],
-        total_rows=stage1["total_rows"],
-        text_table=stage1["text_table"],
     )
 
-    attempt = 0
-    extracted: dict = {}
+    n_pgs = len(merged.get("product_groups", []))
+    n_rows_out = _count_extracted_rows(merged)
+    total_duration = (time.time() - t0) * 1000
 
-    while attempt <= max_retries:
-        attempt += 1
-        attempt_t0 = time.time()
+    # ── Row-count summary ────────────────────────────────────────────
+    failed_chunks = sum(1 for r in chunk_results if r is None)
+    if failed_chunks:
+        merged.setdefault("warnings", []).append(
+            f"{failed_chunks} of {total_chunks} chunk(s) failed LLM extraction"
+        )
 
-        # On retry, append an explicit list of what's missing
-        if attempt == 1:
-            user_msg = base_user
-        else:
-            prev_count = _count_extracted_rows(extracted)
-            user_msg = (
-                base_user
-                + f"\n\n⚠ CRITICAL: Your previous response contained only "
-                  f"{prev_count} rows, but the input has {input_rows} data "
-                  f"rows (R001–R{input_rows:03d}).  You have LOST "
-                  f"{input_rows - prev_count} rows.  Go through the table "
-                  f"row by row and include every single R-numbered row."
-            )
-            print(f"[GFD DEBUG] Retry {attempt}: previous attempt had "
-                  f"{prev_count}/{input_rows} rows")
+    if input_rows > 0 and n_rows_out < input_rows:
+        loss_pct = (1 - n_rows_out / input_rows) * 100
+        loss_msg = (f"Row count mismatch: extracted {n_rows_out} of "
+                    f"{input_rows} input rows ({loss_pct:.0f}% loss)")
+        print(f"[GFD WARNING] {loss_msg}")
+        merged.setdefault("warnings", []).append(loss_msg)
 
-        messages = [
-            SystemMessage(content=base_system),
-            HumanMessage(content=user_msg),
-        ]
+    print(f"[GFD DEBUG] Merged: {n_rows_out}/{input_rows} rows across "
+          f"{n_pgs} product groups  "
+          f"({total_chunks} chunks, {failed_chunks} failed, "
+          f"{total_duration:.0f}ms total)")
 
-        try:
-            response = await llm.ainvoke(messages)
-            raw = response.content.strip()
+    # ── Attach Stage 1 metadata ──────────────────────────────────────
+    merged.setdefault("warnings", [])
+    merged["warnings"] = stage1["warnings"] + merged["warnings"]
+    merged["_meta"] = {
+        "headers": stage1["headers"],
+        "original_headers": stage1.get("original_headers", stage1["headers"]),
+        "total_rows_in_file": stage1["total_rows"],
+        "rows_after_filter": stage1["kept_rows"],
+        "rows_extracted_by_llm": n_rows_out,
+        "extraction_chunks": total_chunks,
+        "extraction_chunks_failed": failed_chunks,
+        "sheet_used": stage1["sheet_used"],
+        "date_col_name": stage1.get("date_col_name"),
+        "customer_col_range": stage1.get("customer_col_range"),
+        "csv_path": stage1.get("csv_path"),
+        "filtered_csv_path": stage1.get("filtered_csv_path"),
+        "text_table_path": text_table_path,
+    }
 
-            # ── Dump raw LLM response for debugging ──────────────────
-            try:
-                csv_path = stage1.get("csv_path")
-                raw_dump_dir = Path(csv_path).parent if csv_path else Path(".")
-                raw_dump_path = raw_dump_dir / f"{session_id}_llm_extract_attempt{attempt}_raw.txt"
-                raw_dump_path.write_text(raw, encoding="utf-8")
-                print(f"[GFD DEBUG] Raw LLM response saved: {raw_dump_path} "
-                      f"({len(raw):,} chars)")
-            except Exception as dump_exc:
-                print(f"[GFD DEBUG] Could not save raw LLM response: {dump_exc}")
+    log_trace(
+        session_id, "gfd_llm_extract",
+        f"Input: {input_rows} rows, {len(stage1['headers'])} columns",
+        f"Extracted {n_rows_out} rows in {n_pgs} groups "
+        f"({total_chunks} chunks, {total_duration:.0f}ms)",
+        total_duration,
+    )
+    print(f"[GFD DEBUG] ═══ Stage 2 complete ({n_rows_out}/{input_rows} rows, "
+          f"{total_chunks} chunks) ═══\n")
 
-            extracted = _parse_llm_json(raw, session_id=session_id, attempt=attempt)
-
-            usage = response.response_metadata.get("token_usage", {})
-            completion_tokens = usage.get("completion_tokens", 0)
-            log_tokens(session_id, f"gfd_llm_extract_attempt{attempt}", usage,
-                       llm_config.get("azure_deployment", ""))
-
-            n_pgs = len(extracted.get("product_groups", []))
-            n_rows_out = _count_extracted_rows(extracted)
-            duration = (time.time() - attempt_t0) * 1000
-
-            print(f"[GFD DEBUG] Attempt {attempt}: LLM returned {n_rows_out}/{input_rows} rows "
-                  f"across {n_pgs} product groups  "
-                  f"(completion_tokens={completion_tokens}, duration={duration:.0f}ms)")
-
-            log_trace(
-                session_id, f"gfd_llm_extract_attempt{attempt}",
-                f"Input: {input_rows} rows, {len(stage1['headers'])} columns",
-                f"Extracted {n_pgs} product groups, {n_rows_out} rows "
-                f"(completion_tokens={completion_tokens})",
-                duration,
-            )
-
-            # ── Row-count validation ─────────────────────────────────
-            if input_rows > 0 and n_rows_out < input_rows:
-                loss_pct = (1 - n_rows_out / input_rows) * 100
-                loss_msg = (
-                    f"Row count mismatch: LLM returned {n_rows_out} of "
-                    f"{input_rows} input rows ({loss_pct:.0f}% loss, "
-                    f"attempt {attempt})"
-                )
-                print(f"[GFD WARNING] {loss_msg}")
-
-                # Tolerate small loss (≤10%) — the LLM may legitimately
-                # skip fully-empty rows; otherwise retry
-                if loss_pct > 10 and attempt <= max_retries:
-                    print(f"[GFD DEBUG] Loss exceeds 10% — will retry")
-                    continue
-
-                extracted.setdefault("warnings", [])
-                extracted["warnings"].append(loss_msg)
-
-            # ── Success — attach Stage 1 metadata ────────────────────
-            extracted.setdefault("warnings", [])
-            extracted["warnings"] = stage1["warnings"] + extracted["warnings"]
-            extracted["_meta"] = {
-                "headers": stage1["headers"],
-                "original_headers": stage1.get("original_headers", stage1["headers"]),
-                "total_rows_in_file": stage1["total_rows"],
-                "rows_after_filter": stage1["kept_rows"],
-                "rows_extracted_by_llm": n_rows_out,
-                "extraction_attempts": attempt,
-                "completion_tokens_used": completion_tokens,
-                "sheet_used": stage1["sheet_used"],
-                "date_col_name": stage1.get("date_col_name"),
-                "customer_col_range": stage1.get("customer_col_range"),
-                "csv_path": stage1.get("csv_path"),
-                "filtered_csv_path": stage1.get("filtered_csv_path"),
-                "text_table_path": text_table_path,
-            }
-
-            total_duration = (time.time() - t0) * 1000
-            log_trace(
-                session_id, "gfd_llm_extract",
-                f"Input: {input_rows} rows, {len(stage1['headers'])} columns",
-                f"Final: {n_pgs} product groups, {n_rows_out} rows "
-                f"(attempts={attempt}, total={total_duration:.0f}ms)",
-                total_duration,
-            )
-            print(f"[GFD DEBUG] ═══ Stage 2 complete ({n_rows_out}/{input_rows} rows, "
-                  f"{attempt} attempt(s)) ═══\n")
-            return extracted
-
-        except json.JSONDecodeError as exc:
-            duration = (time.time() - attempt_t0) * 1000
-            print(f"[GFD ERROR] Attempt {attempt}: JSON parse error — {str(exc)[:120]}")
-            log_trace(session_id, f"gfd_llm_extract_attempt{attempt}",
-                      f"Input: {input_rows} rows",
-                      f"JSON PARSE ERROR: {str(exc)[:120]}", duration, {"error": True})
-            if attempt <= max_retries:
-                continue
-            return _extraction_fallback(stage1, f"LLM returned unparseable JSON: {str(exc)[:200]}")
-
-        except Exception as exc:
-            duration = (time.time() - attempt_t0) * 1000
-            print(f"[GFD ERROR] Attempt {attempt}: {str(exc)[:120]}")
-            log_trace(session_id, f"gfd_llm_extract_attempt{attempt}",
-                      f"Input: {input_rows} rows",
-                      f"ERROR: {str(exc)[:120]}", duration, {"error": True})
-            if attempt <= max_retries:
-                continue
-            return _extraction_fallback(stage1, f"LLM extraction failed: {str(exc)[:200]}")
-
-    # Safety net — should not reach here
-    return _extraction_fallback(stage1, f"All {max_retries + 1} extraction attempts failed")
+    return merged
 
 
 def _extraction_fallback(stage1: dict, error_msg: str) -> dict:
@@ -1052,8 +1164,8 @@ def _extraction_fallback(stage1: dict, error_msg: str) -> dict:
             "total_rows_in_file": stage1["total_rows"],
             "rows_after_filter": stage1["kept_rows"],
             "rows_extracted_by_llm": 0,
-            "extraction_attempts": 0,
-            "completion_tokens_used": 0,
+            "extraction_chunks": 0,
+            "extraction_chunks_failed": 0,
             "sheet_used": stage1["sheet_used"],
             "date_col_name": stage1.get("date_col_name"),
             "customer_col_range": stage1.get("customer_col_range"),
