@@ -49,6 +49,7 @@ from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agent import log_tokens, log_trace
+from gfd_llm_parser import _parse_llm_json
 
 
 # ─── Template path ───────────────────────────────────────────────────
@@ -436,12 +437,7 @@ async def llm_generate_slide_spec(
         response = await llm.ainvoke(messages)
         raw = response.content.strip()
 
-        if raw.startswith("```"):
-            raw = "\n".join(raw.split("\n")[1:])
-        if raw.endswith("```"):
-            raw = "\n".join(raw.split("\n")[:-1])
-
-        spec: dict = json.loads(raw.strip())
+        spec: dict = _parse_llm_json(raw, session_id=session_id)
 
         usage = response.response_metadata.get("token_usage", {})
         log_tokens(session_id, "gfd_llm_slide_spec", usage, llm_config.get("azure_deployment", ""))

@@ -41,6 +41,114 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from agent import log_tokens, log_trace
 
 
+# ─── JSON repair for LLM output ─────────────────────────────────────
+
+def _repair_llm_json(raw: str, debug_label: str = "") -> str:
+    """
+    Attempt to clean common JSON defects produced by LLMs before parsing.
+
+    Handles:
+      1. Markdown fences (```json ... ```)
+      2. Trailing commas before } or ]
+      3. Unescaped literal newlines / tabs inside JSON string values
+      4. Unescaped backslashes (single \\ not part of a valid escape)
+
+    Returns the cleaned string.  Does NOT call json.loads — the caller
+    should do that and can still get a parse error if the damage is
+    too severe for these heuristics.
+    """
+    s = raw.strip()
+
+    # ── 1. Strip markdown fences ─────────────────────────────────────
+    #    Handle ```json, ```JSON, ``` at start; ``` at end.
+    #    Also handle cases where the model wraps in triple-backtick mid-stream.
+    if s.startswith("```"):
+        first_nl = s.index("\n") if "\n" in s else len(s)
+        s = s[first_nl + 1:]
+    if s.endswith("```"):
+        s = s[: s.rfind("```")]
+    s = s.strip()
+
+    # ── 2. Trailing commas — ,} or ,] ───────────────────────────────
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+
+    # ── 3. Unescaped control characters inside string values ─────────
+    #    Walk through the string tracking whether we're inside a JSON
+    #    string (between unescaped double-quotes).  Replace literal
+    #    newlines/tabs/carriage-returns with their escaped forms.
+    result = []
+    in_string = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+
+        if ch == '"' and (i == 0 or s[i - 1] != '\\'):
+            in_string = not in_string
+            result.append(ch)
+        elif in_string:
+            if ch == '\n':
+                result.append('\\n')
+            elif ch == '\r':
+                result.append('\\r')
+            elif ch == '\t':
+                result.append('\\t')
+            else:
+                result.append(ch)
+        else:
+            result.append(ch)
+        i += 1
+    s = "".join(result)
+
+    if debug_label:
+        print(f"[GFD DEBUG] {debug_label}: JSON repair applied "
+              f"({len(raw)} → {len(s)} chars)")
+
+    return s
+
+
+def _parse_llm_json(raw: str, session_id: str = "", attempt: int = 0) -> dict:
+    """
+    Parse LLM JSON output with mandatory repair and detailed error diagnostics.
+
+    Always applies _repair_llm_json before parsing — this is not optional
+    because the source Excel data routinely contains newlines, tabs, and
+    other control characters in free-text fields that the LLM reproduces
+    as literal characters inside JSON string values.
+
+    On failure, logs the region around the error position so you can
+    see exactly what broke.
+    """
+    label = f"attempt{attempt}" if attempt else ""
+
+    # Always apply repair — source data routinely contains control chars
+    repaired = _repair_llm_json(raw, debug_label=label)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError as exc:
+        # Log context around the error position for debugging
+        pos = exc.pos or 0
+        start = max(0, pos - 120)
+        end = min(len(repaired), pos + 120)
+        context = repaired[start:end]
+        pointer_offset = pos - start
+
+        print(f"[GFD ERROR] JSON parse failed after repair — "
+              f"line {exc.lineno}, col {exc.colno}, char {pos}")
+        print(f"[GFD ERROR] Context around error position:")
+        print(f"  ...{context}...")
+        print(f"  {' ' * (pointer_offset + 5)}^ error here")
+
+        # Save the raw LLM response for post-mortem inspection
+        try:
+            dump_path = Path(f"/tmp/gfd_llm_raw_{session_id}_attempt{attempt}.txt")
+            dump_path.write_text(raw, encoding="utf-8")
+            print(f"[GFD ERROR] Raw LLM response saved: {dump_path}")
+        except Exception:
+            pass
+
+        raise
+
+
 # ─── CW utilities ────────────────────────────────────────────────────
 
 def _get_current_cw() -> tuple[int, int]:
@@ -813,13 +921,7 @@ async def llm_extract_gfd_data(
             response = await llm.ainvoke(messages)
             raw = response.content.strip()
 
-            # Strip markdown fences if the model disobeyed instructions
-            if raw.startswith("```"):
-                raw = "\n".join(raw.split("\n")[1:])
-            if raw.endswith("```"):
-                raw = "\n".join(raw.split("\n")[:-1])
-
-            extracted = json.loads(raw.strip())
+            extracted = _parse_llm_json(raw, session_id=session_id, attempt=attempt)
 
             usage = response.response_metadata.get("token_usage", {})
             completion_tokens = usage.get("completion_tokens", 0)
