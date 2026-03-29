@@ -16,19 +16,13 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse
-# summarizer imports
+
 from ppt_parser import parse_presentation
 from glossary import load_glossary_dir, load_glossary_file, normalise_json, render_glossary_for_prompt
 from docx_export import markdown_to_docx
-# gfd module imports
 from gfd_llm_parser import parse_gfd_with_llm
 from gfd_llm_slides import generate_gfd_dashboard
 from gfd_docx_export import gfd_spec_to_docx
-# SID module imports
-from sid_llm_parser import parse_sid_with_llm
-from sid_llm_slides import generate_sid_dashboard
-from sid_docx_export import sid_spec_to_docx
-# summarizer agent
 from agent import (
     build_summarization_graph,
     refine_summary,
@@ -92,7 +86,6 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 sessions: dict[str, dict] = {}
 gfd_sessions: dict[str, dict] = {}
-sid_sessions: dict[str, dict] = {}
 
 
 def get_session(session_id: str) -> dict:
@@ -122,9 +115,6 @@ async def tokens_page():
 async def gfd_page():
     return (STATIC_DIR / "gfd.html").read_text()
 
-@app.get("/sid", response_class=HTMLResponse)
-async def sid_page():
-    return (STATIC_DIR / "sid.html").read_text()
 
 # ─── Routes: API ──────────────────────────────────────────────────────
 
@@ -661,192 +651,6 @@ async def get_gfd_session(session_id: str):
         },
     }
 
-# ─── Routes: SID Dashboard ──────────────────────────────────────────
-
-@app.post("/api/sid/upload")
-async def upload_sid(file: UploadFile = File(...)):
-    """
-    Upload a Supplier Impact Tracking Excel file — runs Stages 1 + 2 only.
-
-    Stage 1 — deterministic: Excel → filtered pipe-delimited text table
-    Stage 2 — LLM extraction: text table → structured JSON (suppliers)
-
-    Returns the extracted JSON for user review before slide generation.
-    """
-    if not file.filename.endswith((".xlsx", ".xls", ".xlsm")):
-        raise HTTPException(status_code=400, detail="Please upload an .xlsx file.")
-
-    session_id = str(uuid.uuid4())
-    file_path = UPLOAD_DIR / f"{session_id}_{file.filename}"
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    try:
-        extracted = await parse_sid_with_llm(
-            filepath=str(file_path),
-            llm_config=LLM_CONFIG,
-            session_id=session_id,
-            glossary_context=glossary_prompt_text,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Excel parsing / LLM extraction failed: {str(e)}"
-        )
-
-    sid_sessions[session_id] = {
-        "session_id": session_id,
-        "filename": file.filename,
-        "file_path": str(file_path),
-        "pptx_path": None,
-        "extracted": extracted,
-        "slide_spec": None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    meta = extracted.get("_meta", {})
-    extracted_for_display = {k: v for k, v in extracted.items() if k != "_meta"}
-
-    return {
-        "session_id": session_id,
-        "filename": file.filename,
-        "current_cw": extracted.get("current_cw", ""),
-        "total_rows_in_file": meta.get("total_rows_in_file", 0),
-        "rows_after_filter": meta.get("rows_after_filter", 0),
-        "rows_extracted_by_llm": meta.get("rows_extracted_by_llm", 0),
-        "extraction_chunks": meta.get("extraction_chunks", 1),
-        "extraction_chunks_failed": meta.get("extraction_chunks_failed", 0),
-        "suppliers": extracted.get("suppliers", []),
-        "extraction_notes": extracted.get("extraction_notes", ""),
-        "warnings": extracted.get("warnings", []),
-        "extracted_json": extracted_for_display,
-    }
-
-
-@app.post("/api/sid/generate")
-async def generate_sid(session_id: str = Form(...), format: str = Form("pptx")):
-    """
-    Generate the SID dashboard from previously extracted data (Stage 3 + 4).
-    Must be called after /api/sid/upload.
-    """
-    if session_id not in sid_sessions:
-        raise HTTPException(status_code=404, detail="SID session not found. Please upload first.")
-
-    sess = sid_sessions[session_id]
-    extracted = sess.get("extracted")
-    if not extracted:
-        raise HTTPException(status_code=400, detail="No extracted data in session.")
-
-    if sess.get("slide_spec") is None:
-        pptx_path = str(UPLOAD_DIR / f"{session_id}_sid_dashboard.pptx")
-        try:
-            buf, slide_spec = await generate_sid_dashboard(
-                extracted_data=extracted,
-                llm_config=LLM_CONFIG,
-                session_id=session_id,
-                output_path=pptx_path,
-                glossary_context=glossary_prompt_text,
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Slide generation failed: {str(e)}"
-            )
-        sess["slide_spec"] = slide_spec
-        sess["pptx_path"] = pptx_path
-
-    slide_spec = sess["slide_spec"]
-
-    return {
-        "session_id": session_id,
-        "filename": sess["filename"],
-        "overall_severity": slide_spec.get("overall_severity", ""),
-        "slide_count": slide_spec.get("slide_count", 2),
-        "is_fallback": slide_spec.get("_fallback", False),
-        "affected_count": len(slide_spec.get("affected_suppliers", [])),
-        "detail_count": len(slide_spec.get("supplier_details", [])),
-    }
-
-
-@app.get("/api/sid/download")
-async def download_sid_pptx(session_id: str = Query(...)):
-    """Download the generated SID dashboard as a .pptx file."""
-    if session_id not in sid_sessions:
-        raise HTTPException(status_code=404, detail="SID session not found.")
-
-    sess = sid_sessions[session_id]
-    if not sess.get("pptx_path"):
-        raise HTTPException(status_code=400, detail="Dashboard not yet generated. Call /api/sid/generate first.")
-
-    pptx_path = Path(sess["pptx_path"])
-    if not pptx_path.exists():
-        raise HTTPException(status_code=500, detail="Generated PPTX file not found.")
-
-    source_name = sess.get("filename", "dashboard")
-    download_name = f"SID_Dashboard_{source_name.replace('.xlsx', '')}.pptx"
-
-    return StreamingResponse(
-        open(pptx_path, "rb"),
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-    )
-
-
-@app.get("/api/sid/download/docx")
-async def download_sid_docx(session_id: str = Query(...)):
-    """Download the SID dashboard as a formatted .docx Word document."""
-    if session_id not in sid_sessions:
-        raise HTTPException(status_code=404, detail="SID session not found.")
-
-    sess = sid_sessions[session_id]
-    slide_spec = sess.get("slide_spec")
-    if not slide_spec:
-        raise HTTPException(status_code=400, detail="Dashboard not yet generated. Call /api/sid/generate first.")
-
-    buf = sid_spec_to_docx(slide_spec)
-
-    source_name = sess.get("filename", "dashboard")
-    download_name = f"SID_Dashboard_{source_name.replace('.xlsx', '')}.docx"
-
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-    )
-
-
-@app.get("/api/sid/session/{session_id}")
-async def get_sid_session(session_id: str):
-    """Return metadata for a SID session."""
-    if session_id not in sid_sessions:
-        raise HTTPException(status_code=404, detail="SID session not found.")
-
-    sess = sid_sessions[session_id]
-    extracted = sess.get("extracted", {})
-    slide_spec = sess.get("slide_spec") or {}
-    meta = extracted.get("_meta", {})
-
-    return {
-        "session_id": session_id,
-        "filename": sess["filename"],
-        "created_at": sess["created_at"],
-        "current_cw": extracted.get("current_cw", ""),
-        "extraction_notes": extracted.get("extraction_notes", ""),
-        "warnings": extracted.get("warnings", []),
-        "overall_severity": slide_spec.get("overall_severity", ""),
-        "slide_count": slide_spec.get("slide_count", 0),
-        "is_fallback": slide_spec.get("_fallback", False),
-        "is_generated": sess.get("slide_spec") is not None,
-        "supplier_count": len(extracted.get("suppliers", [])),
-        "metadata": {
-            "total_rows_in_file": meta.get("total_rows_in_file", 0),
-            "rows_after_filter": meta.get("rows_after_filter", 0),
-            "rows_extracted_by_llm": meta.get("rows_extracted_by_llm", 0),
-            "extraction_chunks": meta.get("extraction_chunks", 1),
-            "extraction_chunks_failed": meta.get("extraction_chunks_failed", 0),
-            "sheet_used": meta.get("sheet_used", ""),
-        },
-    }
 
 if __name__ == "__main__":
     import uvicorn
