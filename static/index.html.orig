@@ -422,7 +422,6 @@
   <div class="topbar-nav">
     <a href="/" class="active">Summarizer</a>
     <a href="/gfd">GFD Dashboard</a>
-    <a href="/sid">SID Dashboard</a>
     <a href="/tracing">Traces</a>
     <a href="/tokens">Token Usage</a>
   </div>
