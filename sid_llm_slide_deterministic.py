@@ -272,7 +272,9 @@ _SLIDES_SYSTEM = """\
 You are a Chief Procurement Officer designing a Supplier Impact Dashboard
 presentation for a board-level audience. You are given JSON extracted from
 the KB Input worksheet of a Supplier Impact Tracking file.
-Generate a COMPLETE two-slide specification as JSON.
+Generate the SLIDE 1 (overview) specification as JSON.
+Slide 2 (supplier fulfillment detail) will be built deterministically — do NOT
+include a "supplier_details" array in your output.
 
 ═══ SLIDE 1 — SUPPLIER IMPACT OVERVIEW ═══
 
@@ -312,20 +314,6 @@ This slide has FOUR sections:
    "15 of 48 suppliers confirmed as impacted. Sub-supplier dependencies
    remain under evaluation."
 
-═══ SLIDE 2 — SUPPLIER FULFILLMENT DETAIL ═══
-
-One row per impacted supplier with columns:
-  supplier_name, host, material_planner, sda, coverage_date, coverage_after_actions,
-  affected_product, customer, remarks
-
-Content rules:
-- coverage_date: use the date field or coverage date, format DD.MM.YYYY
-- coverage_after_actions: qualitative (e.g. "No visibility", "ICO available",
-  "Backup identified", "5 days additional")
-- affected_product: from device_product_line field
-- customer: combine dom_customer_name and ico_customer_name
-- remarks: full root cause / mitigation details. Preserve ALL text — do NOT truncate.
-
 ═══ OUTPUT FORMAT ═══
 
 Respond with ONLY valid JSON — no markdown fences, no explanation text.
@@ -363,36 +351,72 @@ CRITICAL JSON RULES:
     }}
   ],
   "contextual_notes": "15 of 48 suppliers confirmed impacted. Sub-supplier dependencies under evaluation.",
-  "supplier_details": [
-    {{
-      "supplier_name": "Supplier Corp.",
-      "host": "Person A",
-      "material_planner": "Person B",
-      "sda": "Person C",
-      "coverage_date": "25.03.2026",
-      "coverage_after_actions": "ICO available until CW18",
-      "affected_product": "Compressor, Actuator",
-      "customer": "BMW, Mercedes",
-      "remarks": "Root cause: gas supply disruption; dual sourcing under evaluation; interim air freight"
-    }}
-  ],
   "overall_severity": "HIGH",
   "footer_text": "T/SC SDA"
 }}
 
 IMPORTANT:
-  • Include ALL affected suppliers in both tables.
+  • Include ALL affected suppliers (severity R or Y) in the affected_suppliers table.
   • overall_severity = "CRITICAL" if any severity R, "HIGH" if mix R+Y,
     "MEDIUM" if all Y, "LOW" if all G.
+  • Do NOT include "supplier_details" — it will be built from the source data directly.
 {glossary_block}"""
 
 _SLIDES_USER = """\
 Today: {today}
 Current calendar week: {current_cw}
 
-Generate the complete two-slide specification from this extracted data.
+Generate the Slide 1 (overview) specification from this extracted data.
+The data contains {n_suppliers} suppliers total.
+Do NOT include "supplier_details" — Slide 2 is built separately.
 
 {extracted_json}"""
+
+
+def _build_supplier_details(extracted: dict) -> list[dict]:
+    """
+    Build the Slide 2 supplier_details array deterministically from
+    extracted supplier data.  No LLM needed — this is a field remapping.
+
+    Includes all suppliers with severity R or Y (i.e. "impacted").
+    """
+    suppliers = extracted.get("suppliers", [])
+    affected = [
+        s for s in suppliers
+        if str(s.get("severity", "")).upper() in ("R", "Y")
+    ]
+
+    details: list[dict] = []
+    for s in affected:
+        # Combine customer fields
+        customers = "; ".join(filter(None, [
+            str(s.get("dom_customer_name", "") or "").strip(),
+            str(s.get("ico_customer_name", "") or "").strip(),
+        ]))
+
+        # Coverage after actions: use current_fuel_coverage or
+        # al_other_rm_coverage_days as a textual indicator
+        cov_after = str(s.get("current_fuel_coverage", "") or "").strip()
+        if not cov_after:
+            al_cov = s.get("al_other_rm_coverage_days")
+            if al_cov is not None and str(al_cov).strip().lower() not in (
+                "", "nan", "none", "null", "n/a",
+            ):
+                cov_after = f"{al_cov} days (AL/other RM)"
+
+        details.append({
+            "supplier_name": str(s.get("vendor", "") or "").strip(),
+            "host": str(s.get("host", "") or "").strip(),
+            "material_planner": str(s.get("category_buyer", "") or "").strip(),
+            "sda": str(s.get("sda", "") or "").strip(),
+            "coverage_date": str(s.get("date", "") or "").strip(),
+            "coverage_after_actions": cov_after,
+            "affected_product": str(s.get("device_product_line", "") or "").strip(),
+            "customer": customers,
+            "remarks": str(s.get("remarks", "") or "").strip(),
+        })
+
+    return details
 
 
 async def llm_generate_slide_spec(
@@ -401,14 +425,14 @@ async def llm_generate_slide_spec(
     session_id: str,
     glossary_context: str = "",
 ) -> dict:
-    """Stage 3: LLM generates a complete slide specification."""
-    llm = _create_llm(llm_config, max_tokens=64000)
+    """Stage 3: LLM generates Slide 1 spec; Slide 2 details built deterministically."""
+    llm = _create_llm(llm_config, max_tokens=16000)
     t0 = time.time()
     today = date.today().strftime("%d.%m.%Y")
     current_cw = extracted.get("current_cw", "CW??/????")
 
     n_input_suppliers = len(extracted.get("suppliers", []))
-    print(f"\n[SID DEBUG] ═══ Stage 3: LLM slide spec ═══")
+    print(f"\n[SID DEBUG] ═══ Stage 3: LLM slide spec (Slide 1 only) ═══")
     print(f"[SID DEBUG] Input: {n_input_suppliers} suppliers, CW={current_cw}")
 
     glossary_block = (
@@ -425,6 +449,7 @@ async def llm_generate_slide_spec(
         HumanMessage(content=_SLIDES_USER.format(
             today=today,
             current_cw=current_cw,
+            n_suppliers=n_input_suppliers,
             extracted_json=extracted_json,
         )),
     ]
@@ -444,6 +469,11 @@ async def llm_generate_slide_spec(
 
         spec: dict = _parse_llm_json(raw, session_id=session_id)
 
+        # ── Build Slide 2 (supplier details) deterministically ───
+        # The LLM only produced Slide 1 content; Slide 2 is a
+        # field remapping that doesn't need LLM intelligence.
+        spec["supplier_details"] = _build_supplier_details(extracted)
+
         usage = response.response_metadata.get("token_usage", {})
         log_tokens(session_id, "sid_llm_slide_spec", usage,
                    llm_config.get("azure_deployment", ""))
@@ -454,13 +484,13 @@ async def llm_generate_slide_spec(
         n_actions = len(spec.get("actions", []))
 
         print(f"[SID DEBUG] Slide spec generated: {n_affected} affected suppliers, "
-              f"{n_details} detail rows, {n_actions} actions "
+              f"{n_details} detail rows (deterministic), {n_actions} actions "
               f"(severity={spec.get('overall_severity', '?')}, {duration:.0f}ms)")
 
         log_trace(session_id, "sid_llm_slide_spec",
                   f"Input: {len(extracted.get('suppliers', []))} suppliers",
-                  f"Spec: {n_affected} affected, {n_details} detail rows, "
-                  f"{n_actions} actions ({duration:.0f}ms)",
+                  f"Spec: {n_affected} affected, {n_details} detail rows "
+                  f"(deterministic), {n_actions} actions ({duration:.0f}ms)",
                   duration)
         return spec
 
