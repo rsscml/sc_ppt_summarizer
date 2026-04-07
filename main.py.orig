@@ -16,20 +16,33 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse
-
+# summarizer imports
 from ppt_parser import parse_presentation
 from glossary import load_glossary_dir, load_glossary_file, normalise_json, render_glossary_for_prompt
 from docx_export import markdown_to_docx
+# gfd module imports
 from gfd_llm_parser import parse_gfd_with_llm
 from gfd_llm_slides import generate_gfd_dashboard
 from gfd_docx_export import gfd_spec_to_docx
+# SID module imports
+from sid_llm_parser import parse_sid_with_llm
+from sid_llm_slides import generate_sid_dashboard
+from sid_docx_export import sid_spec_to_docx
+# summarizer agent
 from agent import (
     build_summarization_graph,
     refine_summary,
     refine_email,
+    generate_delta_email,
     token_usage_log,
     trace_log,
     AgentState,
+)
+from email_history import (
+    save_accepted_email,
+    get_latest_accepted_email,
+    list_accepted_emails,
+    get_accepted_email_by_id,
 )
 
 # ─── Load environment ─────────────────────────────────────────────────
@@ -86,6 +99,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 sessions: dict[str, dict] = {}
 gfd_sessions: dict[str, dict] = {}
+sid_sessions: dict[str, dict] = {}
 
 
 def get_session(session_id: str) -> dict:
@@ -115,6 +129,9 @@ async def tokens_page():
 async def gfd_page():
     return (STATIC_DIR / "gfd.html").read_text()
 
+@app.get("/sid", response_class=HTMLResponse)
+async def sid_page():
+    return (STATIC_DIR / "sid.html").read_text()
 
 # ─── Routes: API ──────────────────────────────────────────────────────
 
@@ -182,7 +199,13 @@ async def upload_ppt(file: UploadFile = File(...)):
 
 
 @app.post("/api/summarize")
-async def summarize(session_id: str = Form(...)):
+async def summarize(session_id: str = Form(...), email_mode: str = Form("auto")):
+    """
+    Run the full summarization workflow.
+    email_mode: 'fresh' = always generate a full email,
+                'delta' = generate changes-only email vs last accepted,
+                'auto'  = delta if a previous accepted email exists, else fresh.
+    """
     sess = get_session(session_id)
     graph = build_summarization_graph()
 
@@ -204,8 +227,42 @@ async def summarize(session_id: str = Form(...)):
 
     sess["section_summaries"] = final_state["section_summaries"]
     sess["executive_summary"] = final_state["executive_summary"]
-    sess["email_summary"] = final_state["email_summary"]
     sess["all_summaries_text"] = final_state["all_summaries_text"]
+
+    # ── Decide email mode ─────────────────────────────────────────────
+    previous = get_latest_accepted_email()
+    is_delta = False
+
+    if email_mode == "auto":
+        use_delta = previous is not None
+    elif email_mode == "delta":
+        use_delta = previous is not None
+    else:
+        use_delta = False
+
+    if use_delta and previous:
+        try:
+            delta_email = await generate_delta_email(
+                session_id=session_id,
+                llm_config=sess["llm_config"],
+                all_summaries_text=final_state["all_summaries_text"],
+                total_slides=sess["parsed_ppt"]["total_slides"],
+                total_sections=sess["parsed_ppt"]["total_sections"],
+                previous_email=previous["email_content"],
+                previous_date=previous["accepted_at"],
+                glossary_context=sess.get("glossary_context", ""),
+            )
+            sess["email_summary"] = delta_email
+            is_delta = True
+        except Exception:
+            # Fall back to the full email the graph already produced
+            sess["email_summary"] = final_state["email_summary"]
+    else:
+        sess["email_summary"] = final_state["email_summary"]
+
+    # Also store the fresh email so user can switch later
+    sess["email_summary_fresh"] = final_state["email_summary"]
+
     sess["conversation_history"].append({
         "role": "assistant",
         "content": final_state["executive_summary"],
@@ -216,7 +273,9 @@ async def summarize(session_id: str = Form(...)):
     return {
         "session_id": session_id,
         "executive_summary": final_state["executive_summary"],
-        "email_summary": final_state["email_summary"],
+        "email_summary": sess["email_summary"],
+        "email_mode_used": "delta" if is_delta else "fresh",
+        "previous_email_date": previous["accepted_at"] if is_delta and previous else None,
         "section_summaries": [
             {"section_name": s["section_name"], "summary": s["summary"]}
             for s in final_state["section_summaries"]
@@ -430,6 +489,106 @@ async def delete_glossary_file(filename: str):
             sess["glossary_context"] = glossary_prompt_text
 
     return {"deleted": filename, "total_entries": len(glossary_entries)}
+
+# ─── Routes: Email History ────────────────────────────────────────────
+
+@app.post("/api/email/accept")
+async def accept_email(session_id: str = Form(...)):
+    """Finalize and persist the current email summary for future delta comparisons."""
+    sess = get_session(session_id)
+    email_content = sess.get("email_summary")
+    if not email_content:
+        raise HTTPException(status_code=400, detail="No email summary to accept.")
+
+    record = save_accepted_email(
+        email_content=email_content,
+        source_filename=sess.get("filename", ""),
+        session_id=session_id,
+        section_summaries_text=sess.get("all_summaries_text", ""),
+        metadata={
+            "total_slides": sess["parsed_ppt"]["total_slides"],
+            "total_sections": sess["parsed_ppt"]["total_sections"],
+        },
+    )
+
+    return {
+        "id": record["id"],
+        "accepted_at": record["accepted_at"],
+        "source_filename": record["source_filename"],
+        "preview": email_content[:200],
+    }
+
+
+@app.get("/api/email/history")
+async def email_history(limit: int = Query(20)):
+    """List previously accepted email summaries (most recent first)."""
+    return {"emails": list_accepted_emails(limit=limit)}
+
+
+@app.get("/api/email/latest")
+async def email_latest():
+    """Return the most recently accepted email, or null if none exists."""
+    latest = get_latest_accepted_email()
+    if not latest:
+        return {"latest": None}
+    return {
+        "latest": {
+            "id": latest["id"],
+            "accepted_at": latest["accepted_at"],
+            "source_filename": latest.get("source_filename", ""),
+            "preview": latest.get("email_content", "")[:200],
+        }
+    }
+
+
+@app.post("/api/email/regenerate")
+async def regenerate_email(
+    session_id: str = Form(...),
+    email_mode: str = Form("fresh"),
+):
+    """
+    Regenerate ONLY the email summary for an existing session in a different mode.
+    Useful when the user wants to switch between delta and fresh after initial generation.
+    Does not re-run section summarization or executive summary.
+    """
+    sess = get_session(session_id)
+    if not sess.get("all_summaries_text"):
+        raise HTTPException(status_code=400, detail="No summaries available. Run /api/summarize first.")
+
+    previous = get_latest_accepted_email()
+    is_delta = False
+
+    if email_mode == "delta" and previous:
+        try:
+            delta_email = await generate_delta_email(
+                session_id=session_id,
+                llm_config=sess["llm_config"],
+                all_summaries_text=sess["all_summaries_text"],
+                total_slides=sess["parsed_ppt"]["total_slides"],
+                total_sections=sess["parsed_ppt"]["total_sections"],
+                previous_email=previous["email_content"],
+                previous_date=previous["accepted_at"],
+                glossary_context=sess.get("glossary_context", ""),
+            )
+            sess["email_summary"] = delta_email
+            is_delta = True
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Delta email generation failed: {str(e)}")
+    elif email_mode == "delta" and not previous:
+        raise HTTPException(status_code=400, detail="No previous accepted email found for delta comparison.")
+    else:
+        # Fresh mode: use the stored fresh email if available, otherwise error
+        fresh = sess.get("email_summary_fresh")
+        if not fresh:
+            raise HTTPException(status_code=400, detail="No fresh email available. Re-run /api/summarize.")
+        sess["email_summary"] = fresh
+
+    return {
+        "session_id": session_id,
+        "email_summary": sess["email_summary"],
+        "email_mode_used": "delta" if is_delta else "fresh",
+        "previous_email_date": previous["accepted_at"] if is_delta and previous else None,
+    }
 
 # ─── Routes: GFD Dashboard ──────────────────────────────────────────
 
@@ -651,6 +810,192 @@ async def get_gfd_session(session_id: str):
         },
     }
 
+# ─── Routes: SID Dashboard ──────────────────────────────────────────
+
+@app.post("/api/sid/upload")
+async def upload_sid(file: UploadFile = File(...)):
+    """
+    Upload a Supplier Impact Tracking Excel file — runs Stages 1 + 2 only.
+
+    Stage 1 — deterministic: Excel → filtered pipe-delimited text table
+    Stage 2 — LLM extraction: text table → structured JSON (suppliers)
+
+    Returns the extracted JSON for user review before slide generation.
+    """
+    if not file.filename.endswith((".xlsx", ".xls", ".xlsm")):
+        raise HTTPException(status_code=400, detail="Please upload an .xlsx file.")
+
+    session_id = str(uuid.uuid4())
+    file_path = UPLOAD_DIR / f"{session_id}_{file.filename}"
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    try:
+        extracted = await parse_sid_with_llm(
+            filepath=str(file_path),
+            llm_config=LLM_CONFIG,
+            session_id=session_id,
+            glossary_context=glossary_prompt_text,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Excel parsing / LLM extraction failed: {str(e)}"
+        )
+
+    sid_sessions[session_id] = {
+        "session_id": session_id,
+        "filename": file.filename,
+        "file_path": str(file_path),
+        "pptx_path": None,
+        "extracted": extracted,
+        "slide_spec": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    meta = extracted.get("_meta", {})
+    extracted_for_display = {k: v for k, v in extracted.items() if k != "_meta"}
+
+    return {
+        "session_id": session_id,
+        "filename": file.filename,
+        "current_cw": extracted.get("current_cw", ""),
+        "total_rows_in_file": meta.get("total_rows_in_file", 0),
+        "rows_after_filter": meta.get("rows_after_filter", 0),
+        "rows_extracted_by_llm": meta.get("rows_extracted_by_llm", 0),
+        "extraction_chunks": meta.get("extraction_chunks", 1),
+        "extraction_chunks_failed": meta.get("extraction_chunks_failed", 0),
+        "suppliers": extracted.get("suppliers", []),
+        "extraction_notes": extracted.get("extraction_notes", ""),
+        "warnings": extracted.get("warnings", []),
+        "extracted_json": extracted_for_display,
+    }
+
+
+@app.post("/api/sid/generate")
+async def generate_sid(session_id: str = Form(...), format: str = Form("pptx")):
+    """
+    Generate the SID dashboard from previously extracted data (Stage 3 + 4).
+    Must be called after /api/sid/upload.
+    """
+    if session_id not in sid_sessions:
+        raise HTTPException(status_code=404, detail="SID session not found. Please upload first.")
+
+    sess = sid_sessions[session_id]
+    extracted = sess.get("extracted")
+    if not extracted:
+        raise HTTPException(status_code=400, detail="No extracted data in session.")
+
+    if sess.get("slide_spec") is None:
+        pptx_path = str(UPLOAD_DIR / f"{session_id}_sid_dashboard.pptx")
+        try:
+            buf, slide_spec = await generate_sid_dashboard(
+                extracted_data=extracted,
+                llm_config=LLM_CONFIG,
+                session_id=session_id,
+                output_path=pptx_path,
+                glossary_context=glossary_prompt_text,
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Slide generation failed: {str(e)}"
+            )
+        sess["slide_spec"] = slide_spec
+        sess["pptx_path"] = pptx_path
+
+    slide_spec = sess["slide_spec"]
+
+    return {
+        "session_id": session_id,
+        "filename": sess["filename"],
+        "overall_severity": slide_spec.get("overall_severity", ""),
+        "slide_count": slide_spec.get("slide_count", 2),
+        "is_fallback": slide_spec.get("_fallback", False),
+        "affected_count": len(slide_spec.get("affected_suppliers", [])),
+        "detail_count": len(slide_spec.get("supplier_details", [])),
+    }
+
+
+@app.get("/api/sid/download")
+async def download_sid_pptx(session_id: str = Query(...)):
+    """Download the generated SID dashboard as a .pptx file."""
+    if session_id not in sid_sessions:
+        raise HTTPException(status_code=404, detail="SID session not found.")
+
+    sess = sid_sessions[session_id]
+    if not sess.get("pptx_path"):
+        raise HTTPException(status_code=400, detail="Dashboard not yet generated. Call /api/sid/generate first.")
+
+    pptx_path = Path(sess["pptx_path"])
+    if not pptx_path.exists():
+        raise HTTPException(status_code=500, detail="Generated PPTX file not found.")
+
+    source_name = sess.get("filename", "dashboard")
+    download_name = f"SID_Dashboard_{source_name.replace('.xlsx', '')}.pptx"
+
+    return StreamingResponse(
+        open(pptx_path, "rb"),
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
+@app.get("/api/sid/download/docx")
+async def download_sid_docx(session_id: str = Query(...)):
+    """Download the SID dashboard as a formatted .docx Word document."""
+    if session_id not in sid_sessions:
+        raise HTTPException(status_code=404, detail="SID session not found.")
+
+    sess = sid_sessions[session_id]
+    slide_spec = sess.get("slide_spec")
+    if not slide_spec:
+        raise HTTPException(status_code=400, detail="Dashboard not yet generated. Call /api/sid/generate first.")
+
+    buf = sid_spec_to_docx(slide_spec)
+
+    source_name = sess.get("filename", "dashboard")
+    download_name = f"SID_Dashboard_{source_name.replace('.xlsx', '')}.docx"
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
+@app.get("/api/sid/session/{session_id}")
+async def get_sid_session(session_id: str):
+    """Return metadata for a SID session."""
+    if session_id not in sid_sessions:
+        raise HTTPException(status_code=404, detail="SID session not found.")
+
+    sess = sid_sessions[session_id]
+    extracted = sess.get("extracted", {})
+    slide_spec = sess.get("slide_spec") or {}
+    meta = extracted.get("_meta", {})
+
+    return {
+        "session_id": session_id,
+        "filename": sess["filename"],
+        "created_at": sess["created_at"],
+        "current_cw": extracted.get("current_cw", ""),
+        "extraction_notes": extracted.get("extraction_notes", ""),
+        "warnings": extracted.get("warnings", []),
+        "overall_severity": slide_spec.get("overall_severity", ""),
+        "slide_count": slide_spec.get("slide_count", 0),
+        "is_fallback": slide_spec.get("_fallback", False),
+        "is_generated": sess.get("slide_spec") is not None,
+        "supplier_count": len(extracted.get("suppliers", [])),
+        "metadata": {
+            "total_rows_in_file": meta.get("total_rows_in_file", 0),
+            "rows_after_filter": meta.get("rows_after_filter", 0),
+            "rows_extracted_by_llm": meta.get("rows_extracted_by_llm", 0),
+            "extraction_chunks": meta.get("extraction_chunks", 1),
+            "extraction_chunks_failed": meta.get("extraction_chunks_failed", 0),
+            "sheet_used": meta.get("sheet_used", ""),
+        },
+    }
 
 if __name__ == "__main__":
     import uvicorn

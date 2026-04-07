@@ -245,9 +245,8 @@ async def summarize(session_id: str = Form(...), email_mode: str = Form("auto"))
             delta_email = await generate_delta_email(
                 session_id=session_id,
                 llm_config=sess["llm_config"],
+                current_fresh_email=final_state["email_summary"],
                 all_summaries_text=final_state["all_summaries_text"],
-                total_slides=sess["parsed_ppt"]["total_slides"],
-                total_sections=sess["parsed_ppt"]["total_sections"],
                 previous_email=previous["email_content"],
                 previous_date=previous["accepted_at"],
                 glossary_context=sess.get("glossary_context", ""),
@@ -559,13 +558,15 @@ async def regenerate_email(
     is_delta = False
 
     if email_mode == "delta" and previous:
+        fresh = sess.get("email_summary_fresh")
+        if not fresh:
+            raise HTTPException(status_code=400, detail="No fresh email available for comparison. Re-run /api/summarize.")
         try:
             delta_email = await generate_delta_email(
                 session_id=session_id,
                 llm_config=sess["llm_config"],
+                current_fresh_email=fresh,
                 all_summaries_text=sess["all_summaries_text"],
-                total_slides=sess["parsed_ppt"]["total_slides"],
-                total_sections=sess["parsed_ppt"]["total_sections"],
                 previous_email=previous["email_content"],
                 previous_date=previous["accepted_at"],
                 glossary_context=sess.get("glossary_context", ""),

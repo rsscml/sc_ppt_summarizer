@@ -193,31 +193,30 @@ EMAIL_SUMMARY_USER = """Based on the following section‑by‑section summaries 
 DELTA_EMAIL_SYSTEM = """You are a senior supply chain executive drafting a **changes-only** email update for leadership and cross‑functional stakeholders of a global automotive parts manufacturer.
 
 You are provided with:
-1. The PREVIOUS accepted email (the last version sent to leadership).
-2. The CURRENT fresh email (generated from today's updated presentation, same format).
-3. The CURRENT section summaries (for factual grounding only — do NOT compare against these).
+1. The PREVIOUS accepted email summary (the last version sent to leadership).
+2. The CURRENT section‑by‑section summaries from today's updated presentation.
 
-YOUR TASK: Compare the PREVIOUS email against the CURRENT email and report ONLY material factual differences. Do NOT repeat information that is unchanged.
+YOUR TASK: Write an email that highlights ONLY what has changed, what is new, and what has been resolved since the previous email. Do NOT repeat information that is unchanged.
 
-CRITICAL RULES — READ CAREFULLY:
-1. ONLY report changes in UNDERLYING FACTS: numbers that changed, new items/risks/suppliers that appeared, items that disappeared, dates that shifted, statuses that changed (e.g. RED → GREEN, coverage extended from CW15 → CW18, cost estimate revised).
-2. Differences in wording, sentence structure, phrasing, level of detail, or formatting between the two emails DO NOT count as changes. Both emails describe the same underlying data — ignore all stylistic and structural variation.
-3. If a figure has changed, state the change with both old and new values: "Coverage for X extended from CW15 to CW18" or "Cost estimate revised from €2.1M to €2.5M".
-4. If an entirely new topic, product group, risk, or action appears in the current email that was absent from the previous email, include it under a "NEW" heading.
-5. If a previously reported risk or issue is absent from the current email, note it as resolved/closed.
-6. DO NOT repeat unchanged facts. DO NOT rephrase existing information as if it were new.
+CRITICAL RULES:
+1. Compare the current section summaries against the previous email carefully.
+2. ONLY include information that is NEW, CHANGED, WORSENED, IMPROVED, or RESOLVED compared to the previous email.
+3. If a figure has changed (e.g. coverage week extended, cost estimate updated, new supplier added/removed), state the change with both old and new values where possible.
+4. If an entirely new topic, product group, risk, or action appears in the current data that was not covered at all in the previous email, include it under a "NEW" label.
+5. If a previously reported risk or issue is no longer present in the current data, note it as resolved/closed.
+6. DO NOT repeat unchanged facts from the previous email.
 7. Where abbreviations appear, use the company glossary to expand them on first mention.
-8. If NO material factual differences exist between the two emails, your entire email body after the greeting should simply state: "No material changes since the last update." Do not pad the email with restatements of unchanged facts.
+8. If very little has changed, the email should be short — that is correct and expected.
 
 STRUCTURE:
 - Start with "Dear all," and a one‑line context: "This update covers changes since the last report dated [previous date]."
-- Use markdown headings (###) to group changes logically — include ONLY sections where real factual changes exist:
+- Use markdown headings (###) to group changes logically:
   ### Key Changes & Developments
   ### New Risks / Escalations
   ### Improved / Resolved Items
   ### Updated Figures & Metrics
   ### New Information (not previously covered)
-- Skip any heading where there are no actual changes.
+- Only include sections where there are actual changes. Skip empty sections entirely.
 - End with a brief sign‑off line.
 {glossary_block}"""
 
@@ -226,17 +225,12 @@ DELTA_EMAIL_USER = """PREVIOUS ACCEPTED EMAIL (sent on {previous_date}):
 {previous_email}
 --- END PREVIOUS EMAIL ---
 
-CURRENT FRESH EMAIL (generated from today's presentation, same format — compare against this):
---- START CURRENT EMAIL ---
-{current_fresh_email}
---- END CURRENT EMAIL ---
-
-CURRENT SECTION SUMMARIES (for factual grounding only — do NOT compare against these):
---- START SECTION SUMMARIES ---
+CURRENT section‑by‑section summaries from today's presentation ({total_slides} slides, {total_sections} sections):
+--- START CURRENT SUMMARIES ---
 {all_summaries}
---- END SECTION SUMMARIES ---
+--- END CURRENT SUMMARIES ---
 
-Draft the delta/changes-only email update. Report ONLY material factual differences between the previous and current emails. If nothing has materially changed, say so."""
+Draft the delta/changes-only email update. Include only what has changed, what is new, and what has been resolved."""
 
 REFINE_SYSTEM = """You are helping refine an executive summary of a Global Supply Chain Status Report. 
 The user will provide instructions for changes. Apply them precisely.
@@ -495,16 +489,16 @@ async def refine_email(session_id: str, llm_config: dict,
 async def generate_delta_email(
     session_id: str,
     llm_config: dict,
-    current_fresh_email: str,
     all_summaries_text: str,
+    total_slides: int,
+    total_sections: int,
     previous_email: str,
     previous_date: str,
     glossary_context: str = "",
 ) -> str:
     """
-    Generate a delta/changes-only email by comparing the current fresh email
-    against the previously accepted email (same format → same format).
-    Section summaries are provided only for factual grounding.
+    Generate a delta/changes-only email by comparing current section summaries
+    against the previously accepted email.
     """
     llm = create_llm(llm_config)
     t0 = time.time()
@@ -515,7 +509,8 @@ async def generate_delta_email(
         HumanMessage(content=DELTA_EMAIL_USER.format(
             previous_date=previous_date,
             previous_email=previous_email,
-            current_fresh_email=current_fresh_email,
+            total_slides=total_slides,
+            total_sections=total_sections,
             all_summaries=all_summaries_text,
         )),
     ]
