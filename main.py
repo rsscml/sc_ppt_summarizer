@@ -33,9 +33,16 @@ from agent import (
     build_summarization_graph,
     refine_summary,
     refine_email,
+    generate_delta_email,
     token_usage_log,
     trace_log,
     AgentState,
+)
+from email_history import (
+    save_accepted_email,
+    get_latest_accepted_email,
+    list_accepted_emails,
+    get_accepted_email_by_id,
 )
 
 # ─── Load environment ─────────────────────────────────────────────────
@@ -192,7 +199,13 @@ async def upload_ppt(file: UploadFile = File(...)):
 
 
 @app.post("/api/summarize")
-async def summarize(session_id: str = Form(...)):
+async def summarize(session_id: str = Form(...), email_mode: str = Form("auto")):
+    """
+    Run the full summarization workflow.
+    email_mode: 'fresh' = always generate a full email,
+                'delta' = generate changes-only email vs last accepted,
+                'auto'  = delta if a previous accepted email exists, else fresh.
+    """
     sess = get_session(session_id)
     graph = build_summarization_graph()
 
@@ -214,8 +227,42 @@ async def summarize(session_id: str = Form(...)):
 
     sess["section_summaries"] = final_state["section_summaries"]
     sess["executive_summary"] = final_state["executive_summary"]
-    sess["email_summary"] = final_state["email_summary"]
     sess["all_summaries_text"] = final_state["all_summaries_text"]
+
+    # ── Decide email mode ─────────────────────────────────────────────
+    previous = get_latest_accepted_email()
+    is_delta = False
+
+    if email_mode == "auto":
+        use_delta = previous is not None
+    elif email_mode == "delta":
+        use_delta = previous is not None
+    else:
+        use_delta = False
+
+    if use_delta and previous:
+        try:
+            delta_email = await generate_delta_email(
+                session_id=session_id,
+                llm_config=sess["llm_config"],
+                all_summaries_text=final_state["all_summaries_text"],
+                total_slides=sess["parsed_ppt"]["total_slides"],
+                total_sections=sess["parsed_ppt"]["total_sections"],
+                previous_email=previous["email_content"],
+                previous_date=previous["accepted_at"],
+                glossary_context=sess.get("glossary_context", ""),
+            )
+            sess["email_summary"] = delta_email
+            is_delta = True
+        except Exception:
+            # Fall back to the full email the graph already produced
+            sess["email_summary"] = final_state["email_summary"]
+    else:
+        sess["email_summary"] = final_state["email_summary"]
+
+    # Also store the fresh email so user can switch later
+    sess["email_summary_fresh"] = final_state["email_summary"]
+
     sess["conversation_history"].append({
         "role": "assistant",
         "content": final_state["executive_summary"],
@@ -226,7 +273,9 @@ async def summarize(session_id: str = Form(...)):
     return {
         "session_id": session_id,
         "executive_summary": final_state["executive_summary"],
-        "email_summary": final_state["email_summary"],
+        "email_summary": sess["email_summary"],
+        "email_mode_used": "delta" if is_delta else "fresh",
+        "previous_email_date": previous["accepted_at"] if is_delta and previous else None,
         "section_summaries": [
             {"section_name": s["section_name"], "summary": s["summary"]}
             for s in final_state["section_summaries"]
@@ -440,6 +489,106 @@ async def delete_glossary_file(filename: str):
             sess["glossary_context"] = glossary_prompt_text
 
     return {"deleted": filename, "total_entries": len(glossary_entries)}
+
+# ─── Routes: Email History ────────────────────────────────────────────
+
+@app.post("/api/email/accept")
+async def accept_email(session_id: str = Form(...)):
+    """Finalize and persist the current email summary for future delta comparisons."""
+    sess = get_session(session_id)
+    email_content = sess.get("email_summary")
+    if not email_content:
+        raise HTTPException(status_code=400, detail="No email summary to accept.")
+
+    record = save_accepted_email(
+        email_content=email_content,
+        source_filename=sess.get("filename", ""),
+        session_id=session_id,
+        section_summaries_text=sess.get("all_summaries_text", ""),
+        metadata={
+            "total_slides": sess["parsed_ppt"]["total_slides"],
+            "total_sections": sess["parsed_ppt"]["total_sections"],
+        },
+    )
+
+    return {
+        "id": record["id"],
+        "accepted_at": record["accepted_at"],
+        "source_filename": record["source_filename"],
+        "preview": email_content[:200],
+    }
+
+
+@app.get("/api/email/history")
+async def email_history(limit: int = Query(20)):
+    """List previously accepted email summaries (most recent first)."""
+    return {"emails": list_accepted_emails(limit=limit)}
+
+
+@app.get("/api/email/latest")
+async def email_latest():
+    """Return the most recently accepted email, or null if none exists."""
+    latest = get_latest_accepted_email()
+    if not latest:
+        return {"latest": None}
+    return {
+        "latest": {
+            "id": latest["id"],
+            "accepted_at": latest["accepted_at"],
+            "source_filename": latest.get("source_filename", ""),
+            "preview": latest.get("email_content", "")[:200],
+        }
+    }
+
+
+@app.post("/api/email/regenerate")
+async def regenerate_email(
+    session_id: str = Form(...),
+    email_mode: str = Form("fresh"),
+):
+    """
+    Regenerate ONLY the email summary for an existing session in a different mode.
+    Useful when the user wants to switch between delta and fresh after initial generation.
+    Does not re-run section summarization or executive summary.
+    """
+    sess = get_session(session_id)
+    if not sess.get("all_summaries_text"):
+        raise HTTPException(status_code=400, detail="No summaries available. Run /api/summarize first.")
+
+    previous = get_latest_accepted_email()
+    is_delta = False
+
+    if email_mode == "delta" and previous:
+        try:
+            delta_email = await generate_delta_email(
+                session_id=session_id,
+                llm_config=sess["llm_config"],
+                all_summaries_text=sess["all_summaries_text"],
+                total_slides=sess["parsed_ppt"]["total_slides"],
+                total_sections=sess["parsed_ppt"]["total_sections"],
+                previous_email=previous["email_content"],
+                previous_date=previous["accepted_at"],
+                glossary_context=sess.get("glossary_context", ""),
+            )
+            sess["email_summary"] = delta_email
+            is_delta = True
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Delta email generation failed: {str(e)}")
+    elif email_mode == "delta" and not previous:
+        raise HTTPException(status_code=400, detail="No previous accepted email found for delta comparison.")
+    else:
+        # Fresh mode: use the stored fresh email if available, otherwise error
+        fresh = sess.get("email_summary_fresh")
+        if not fresh:
+            raise HTTPException(status_code=400, detail="No fresh email available. Re-run /api/summarize.")
+        sess["email_summary"] = fresh
+
+    return {
+        "session_id": session_id,
+        "email_summary": sess["email_summary"],
+        "email_mode_used": "delta" if is_delta else "fresh",
+        "previous_email_date": previous["accepted_at"] if is_delta and previous else None,
+    }
 
 # ─── Routes: GFD Dashboard ──────────────────────────────────────────
 

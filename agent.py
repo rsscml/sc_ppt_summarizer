@@ -190,6 +190,48 @@ EMAIL_SUMMARY_USER = """Based on the following section‑by‑section summaries 
 
 {all_summaries}"""
 
+DELTA_EMAIL_SYSTEM = """You are a senior supply chain executive drafting a **changes-only** email update for leadership and cross‑functional stakeholders of a global automotive parts manufacturer.
+
+You are provided with:
+1. The PREVIOUS accepted email summary (the last version sent to leadership).
+2. The CURRENT section‑by‑section summaries from today's updated presentation.
+
+YOUR TASK: Write an email that highlights ONLY what has changed, what is new, and what has been resolved since the previous email. Do NOT repeat information that is unchanged.
+
+CRITICAL RULES:
+1. Compare the current section summaries against the previous email carefully.
+2. ONLY include information that is NEW, CHANGED, WORSENED, IMPROVED, or RESOLVED compared to the previous email.
+3. If a figure has changed (e.g. coverage week extended, cost estimate updated, new supplier added/removed), state the change with both old and new values where possible.
+4. If an entirely new topic, product group, risk, or action appears in the current data that was not covered at all in the previous email, include it under a "NEW" label.
+5. If a previously reported risk or issue is no longer present in the current data, note it as resolved/closed.
+6. DO NOT repeat unchanged facts from the previous email.
+7. Where abbreviations appear, use the company glossary to expand them on first mention.
+8. If very little has changed, the email should be short — that is correct and expected.
+
+STRUCTURE:
+- Start with "Dear all," and a one‑line context: "This update covers changes since the last report dated [previous date]."
+- Use markdown headings (###) to group changes logically:
+  ### Key Changes & Developments
+  ### New Risks / Escalations
+  ### Improved / Resolved Items
+  ### Updated Figures & Metrics
+  ### New Information (not previously covered)
+- Only include sections where there are actual changes. Skip empty sections entirely.
+- End with a brief sign‑off line.
+{glossary_block}"""
+
+DELTA_EMAIL_USER = """PREVIOUS ACCEPTED EMAIL (sent on {previous_date}):
+--- START PREVIOUS EMAIL ---
+{previous_email}
+--- END PREVIOUS EMAIL ---
+
+CURRENT section‑by‑section summaries from today's presentation ({total_slides} slides, {total_sections} sections):
+--- START CURRENT SUMMARIES ---
+{all_summaries}
+--- END CURRENT SUMMARIES ---
+
+Draft the delta/changes-only email update. Include only what has changed, what is new, and what has been resolved."""
+
 REFINE_SYSTEM = """You are helping refine an executive summary of a Global Supply Chain Status Report. 
 The user will provide instructions for changes. Apply them precisely.
 
@@ -442,3 +484,46 @@ async def refine_email(session_id: str, llm_config: dict,
               refined[:300], duration)
 
     return refined
+
+
+async def generate_delta_email(
+    session_id: str,
+    llm_config: dict,
+    all_summaries_text: str,
+    total_slides: int,
+    total_sections: int,
+    previous_email: str,
+    previous_date: str,
+    glossary_context: str = "",
+) -> str:
+    """
+    Generate a delta/changes-only email by comparing current section summaries
+    against the previously accepted email.
+    """
+    llm = create_llm(llm_config)
+    t0 = time.time()
+    glossary_block = f"\n\n{glossary_context}" if glossary_context else ""
+
+    messages = [
+        SystemMessage(content=DELTA_EMAIL_SYSTEM.format(glossary_block=glossary_block)),
+        HumanMessage(content=DELTA_EMAIL_USER.format(
+            previous_date=previous_date,
+            previous_email=previous_email,
+            total_slides=total_slides,
+            total_sections=total_sections,
+            all_summaries=all_summaries_text,
+        )),
+    ]
+
+    response = await llm.ainvoke(messages)
+    delta_email = response.content
+
+    usage = response.response_metadata.get("token_usage", {})
+    log_tokens(session_id, "delta_email_summary", usage, llm_config.get("azure_deployment", ""))
+
+    duration = (time.time() - t0) * 1000
+    log_trace(session_id, "generate_delta_email",
+              f"Delta vs previous email from {previous_date}",
+              delta_email[:300], duration)
+
+    return delta_email

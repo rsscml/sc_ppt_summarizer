@@ -410,6 +410,15 @@
   .toast.show { transform: translateY(0); opacity: 1; }
   .toast.error { border-color: var(--red); color: var(--red); }
   .toast.success { border-color: var(--green); color: var(--green); }
+
+  .email-mode-badge {
+    display: inline-block; font-size: 11px; font-weight: 600;
+    padding: 3px 10px; border-radius: 12px; margin-bottom: 12px;
+    letter-spacing: 0.02em;
+  }
+  .email-mode-badge.delta { background: var(--amber-bg); color: var(--amber); }
+  .email-mode-badge.fresh { background: var(--accent-light); color: var(--accent); }
+  #emailModeGroup label.selected { border-color: var(--accent); background: var(--accent-light); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -474,7 +483,25 @@
     <div class="sidebar-section" id="sectionsPanel" style="display:none">
       <div class="sidebar-label">Detected Sections</div>
       <div class="sections-list" id="sectionsList"></div>
+
       <div style="margin-top:14px">
+        <div class="sidebar-label" style="margin-bottom:8px">Email Mode</div>
+        <div id="emailModeGroup" style="display:flex; gap:6px; margin-bottom:12px;">
+          <label style="flex:1; display:flex; align-items:center; gap:5px; padding:8px 10px; border-radius:8px; border:1.5px solid var(--border); cursor:pointer; font-size:12px; font-weight:500; transition:all 0.15s;" id="modeAutoLabel">
+            <input type="radio" name="emailMode" value="auto" checked style="accent-color:var(--accent);"> Auto
+          </label>
+          <label style="flex:1; display:flex; align-items:center; gap:5px; padding:8px 10px; border-radius:8px; border:1.5px solid var(--border); cursor:pointer; font-size:12px; font-weight:500; transition:all 0.15s;" id="modeDeltaLabel">
+            <input type="radio" name="emailMode" value="delta"> Delta
+          </label>
+          <label style="flex:1; display:flex; align-items:center; gap:5px; padding:8px 10px; border-radius:8px; border:1.5px solid var(--border); cursor:pointer; font-size:12px; font-weight:500; transition:all 0.15s;" id="modeFreshLabel">
+            <input type="radio" name="emailMode" value="fresh"> Fresh
+          </label>
+        </div>
+        <div id="prevEmailInfo" style="display:none; background:var(--accent-light); border-radius:8px; padding:10px 12px; margin-bottom:12px; font-size:12px; color:var(--text-dim);">
+          <div style="font-weight:600; color:var(--accent); margin-bottom:3px;">Previous accepted email</div>
+          <div id="prevEmailDate" style="font-family:var(--mono); font-size:11px;"></div>
+          <div id="prevEmailFile" style="font-size:11px; color:var(--text-muted); margin-top:2px;"></div>
+        </div>
         <button class="btn btn-primary btn-full" id="btnSummarize" onclick="runSummarize()">Generate Executive Summary</button>
       </div>
     </div>
@@ -502,6 +529,12 @@
       </button>
       <button class="tab" data-tab="sections" onclick="switchTab('sections')">
         Section Details
+      </button>
+      <button class="tab-dl" id="btnAcceptEmail" onclick="acceptEmail()" title="Accept this email for future delta comparisons" style="border-color:var(--green); color:var(--green);">
+        ✓ Accept Email
+      </button>
+      <button class="tab-dl" id="btnSwitchMode" onclick="switchEmailMode()" title="Switch between delta and fresh email">
+        ↻ Switch to Fresh
       </button>
       <button class="tab-dl" id="btnDownload" onclick="downloadDocx()" title="Download as Word document">
         <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -557,6 +590,8 @@
   let sessionId = null;
   let selectedFile = null;
   let activeTab = 'slides'; // 'slides' | 'email' | 'sections'
+  let currentEmailModeUsed = 'fresh'; // what mode was actually used for the current email
+  let hasPreviousEmail = false;
 
   function toast(msg, type = '') {
     const t = document.getElementById('toast');
@@ -621,11 +656,26 @@
 
     // Show download button only on slides/email tabs when content exists
     const dlBtn = document.getElementById('btnDownload');
+    const acceptBtn = document.getElementById('btnAcceptEmail');
+    const switchBtn = document.getElementById('btnSwitchMode');
     if (tab === 'sections') {
       dlBtn.classList.remove('visible');
+      acceptBtn.classList.remove('visible');
+      switchBtn.classList.remove('visible');
     } else {
       const hasContent = document.getElementById(tab + 'Output')?.querySelector('.summary-block');
       dlBtn.classList.toggle('visible', !!hasContent);
+      // Accept & switch only on email tab
+      acceptBtn.classList.toggle('visible', tab === 'email' && !!hasContent);
+      switchBtn.classList.toggle('visible', tab === 'email' && !!hasContent);
+      // Update switch button label
+      if (tab === 'email') {
+        switchBtn.textContent = currentEmailModeUsed === 'delta' ? '↻ Switch to Fresh' : '↻ Switch to Delta';
+        // Hide switch-to-delta if no previous email exists
+        if (!hasPreviousEmail && currentEmailModeUsed !== 'delta') {
+          switchBtn.classList.remove('visible');
+        }
+      }
     }
   }
 
@@ -713,6 +763,7 @@
 
     const fd = new FormData();
     fd.append('session_id', sessionId);
+    fd.append('email_mode', document.querySelector('input[name="emailMode"]:checked').value);
 
     try {
       const res = await fetch('/api/summarize', { method: 'POST', body: fd });
@@ -723,12 +774,18 @@
       showProgress(100, 'Done');
       setStatus('Ready', 'ready');
 
+      // Track email mode
+      currentEmailModeUsed = data.email_mode_used || 'fresh';
+
       // Slides tab
       slidesOut.innerHTML = '<div class="summary-block">' + mdToHtml(data.executive_summary) + '</div>';
 
-      // Email tab
+      // Email tab — add mode badge
       const emailOut = document.getElementById('emailOutput');
-      emailOut.innerHTML = '<div class="summary-block">' + mdToHtml(data.email_summary) + '</div>';
+      const modeBadge = currentEmailModeUsed === 'delta'
+        ? `<div class="email-mode-badge delta">Δ Delta update — changes since ${formatDate(data.previous_email_date)}</div>`
+        : '<div class="email-mode-badge fresh">Full email summary</div>';
+      emailOut.innerHTML = modeBadge + '<div class="summary-block">' + mdToHtml(data.email_summary) + '</div>';
 
       // Sections tab
       const secOut = document.getElementById('sectionsOutput');
@@ -746,7 +803,7 @@
       document.getElementById('chatBar').classList.add('visible');
       switchTab('slides');
 
-      toast('Slide summary and email generated', 'success');
+      toast(`Slide summary and ${currentEmailModeUsed} email generated`, 'success');
       setTimeout(hideProgress, 1500);
     } catch (e) {
       clearInterval(iv);
@@ -906,7 +963,96 @@
     btn.textContent = peek.classList.contains('visible') ? 'Preview entries ▾' : 'Preview entries ▸';
   }
 
+  // ── Email history ──
+  function formatDate(iso) {
+    if (!iso) return 'unknown';
+    try {
+      const d = new Date(iso);
+      return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    } catch { return iso; }
+  }
+
+  async function loadPreviousEmailInfo() {
+    try {
+      const res = await fetch('/api/email/latest');
+      const data = await res.json();
+      if (data.latest) {
+        hasPreviousEmail = true;
+        document.getElementById('prevEmailInfo').style.display = 'block';
+        document.getElementById('prevEmailDate').textContent = formatDate(data.latest.accepted_at);
+        document.getElementById('prevEmailFile').textContent = `Source: ${data.latest.source_filename || '—'}`;
+      } else {
+        hasPreviousEmail = false;
+        document.getElementById('prevEmailInfo').style.display = 'none';
+      }
+    } catch (e) {
+      console.error('Failed to load previous email info:', e);
+    }
+  }
+
+  async function acceptEmail() {
+    if (!sessionId) return;
+    const btn = document.getElementById('btnAcceptEmail');
+    btn.disabled = true; btn.textContent = 'Saving...';
+    const fd = new FormData();
+    fd.append('session_id', sessionId);
+    try {
+      const res = await fetch('/api/email/accept', { method: 'POST', body: fd });
+      if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Accept failed'); }
+      const data = await res.json();
+      toast(`Email accepted and saved (${formatDate(data.accepted_at)})`, 'success');
+      await loadPreviousEmailInfo();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+    btn.disabled = false; btn.textContent = '✓ Accept Email';
+  }
+
+  async function switchEmailMode() {
+    if (!sessionId) return;
+    const newMode = currentEmailModeUsed === 'delta' ? 'fresh' : 'delta';
+    const btn = document.getElementById('btnSwitchMode');
+    btn.disabled = true; btn.textContent = '↻ Switching...';
+    setStatus('Regenerating', 'processing');
+
+    const fd = new FormData();
+    fd.append('session_id', sessionId);
+    fd.append('email_mode', newMode);
+
+    try {
+      const res = await fetch('/api/email/regenerate', { method: 'POST', body: fd });
+      if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Regeneration failed'); }
+      const data = await res.json();
+
+      currentEmailModeUsed = data.email_mode_used || newMode;
+      const emailOut = document.getElementById('emailOutput');
+      const modeBadge = currentEmailModeUsed === 'delta'
+        ? `<div class="email-mode-badge delta">Δ Delta update — changes since ${formatDate(data.previous_email_date)}</div>`
+        : '<div class="email-mode-badge fresh">Full email summary</div>';
+      emailOut.innerHTML = modeBadge + '<div class="summary-block">' + mdToHtml(data.email_summary) + '</div>';
+
+      setStatus('Ready', 'ready');
+      toast(`Switched to ${currentEmailModeUsed} email`, 'success');
+      switchTab('email');
+    } catch (e) {
+      toast(e.message, 'error');
+      setStatus('Error', 'idle');
+    }
+    btn.disabled = false;
+    btn.textContent = currentEmailModeUsed === 'delta' ? '↻ Switch to Fresh' : '↻ Switch to Delta';
+  }
+
+  // ── Email mode radio highlight ──
+  document.querySelectorAll('#emailModeGroup input[name="emailMode"]').forEach(radio => {
+    radio.addEventListener('change', () => {
+      document.querySelectorAll('#emailModeGroup label').forEach(l => l.classList.remove('selected'));
+      radio.closest('label').classList.add('selected');
+    });
+  });
+  document.querySelector('#modeAutoLabel').classList.add('selected');
+
   loadGlossary();
+  loadPreviousEmailInfo();
 </script>
 </body>
 </html>
