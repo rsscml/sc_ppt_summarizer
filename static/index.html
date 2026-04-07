@@ -782,9 +782,7 @@
 
       // Email tab — add mode badge
       const emailOut = document.getElementById('emailOutput');
-      const modeBadge = currentEmailModeUsed === 'delta'
-        ? `<div class="email-mode-badge delta">Δ Delta update — changes since ${formatDate(data.previous_email_date)}</div>`
-        : '<div class="email-mode-badge fresh">Full email summary</div>';
+      const modeBadge = emailModeBadge(data);
       emailOut.innerHTML = modeBadge + '<div class="summary-block">' + mdToHtml(data.email_summary) + '</div>';
 
       // Sections tab
@@ -972,6 +970,13 @@
     } catch { return iso; }
   }
 
+  function emailModeBadge(data) {
+    if (data.email_mode_used === 'delta') {
+      return `<div class="email-mode-badge delta">Δ Delta update — changes since ${formatDate(data.previous_email_date)}</div>`;
+    }
+    return '<div class="email-mode-badge fresh">Full email summary</div>';
+  }
+
   async function loadPreviousEmailInfo() {
     try {
       const res = await fetch('/api/email/latest');
@@ -1026,9 +1031,7 @@
 
       currentEmailModeUsed = data.email_mode_used || newMode;
       const emailOut = document.getElementById('emailOutput');
-      const modeBadge = currentEmailModeUsed === 'delta'
-        ? `<div class="email-mode-badge delta">Δ Delta update — changes since ${formatDate(data.previous_email_date)}</div>`
-        : '<div class="email-mode-badge fresh">Full email summary</div>';
+      const modeBadge = emailModeBadge(data);
       emailOut.innerHTML = modeBadge + '<div class="summary-block">' + mdToHtml(data.email_summary) + '</div>';
 
       setStatus('Ready', 'ready');

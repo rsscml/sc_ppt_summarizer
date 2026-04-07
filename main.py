@@ -241,20 +241,24 @@ async def summarize(session_id: str = Form(...), email_mode: str = Form("auto"))
         use_delta = False
 
     if use_delta and previous:
-        try:
-            delta_email = await generate_delta_email(
-                session_id=session_id,
-                llm_config=sess["llm_config"],
-                current_fresh_email=final_state["email_summary"],
-                all_summaries_text=final_state["all_summaries_text"],
-                previous_email=previous["email_content"],
-                previous_date=previous["accepted_at"],
-                glossary_context=sess.get("glossary_context", ""),
-            )
-            sess["email_summary"] = delta_email
-            is_delta = True
-        except Exception:
-            # Fall back to the full email the graph already produced
+        previous_summaries = previous.get("section_summaries_text", "")
+        if previous_summaries:
+            try:
+                delta_email = await generate_delta_email(
+                    session_id=session_id,
+                    llm_config=sess["llm_config"],
+                    current_summaries_text=final_state["all_summaries_text"],
+                    previous_summaries_text=previous_summaries,
+                    previous_date=previous["accepted_at"],
+                    glossary_context=sess.get("glossary_context", ""),
+                )
+                sess["email_summary"] = delta_email
+                is_delta = True
+            except Exception:
+                # Fall back to the full email the graph already produced
+                sess["email_summary"] = final_state["email_summary"]
+        else:
+            # Previous record exists but has no summaries — fall back to fresh
             sess["email_summary"] = final_state["email_summary"]
     else:
         sess["email_summary"] = final_state["email_summary"]
@@ -558,16 +562,15 @@ async def regenerate_email(
     is_delta = False
 
     if email_mode == "delta" and previous:
-        fresh = sess.get("email_summary_fresh")
-        if not fresh:
-            raise HTTPException(status_code=400, detail="No fresh email available for comparison. Re-run /api/summarize.")
+        previous_summaries = previous.get("section_summaries_text", "")
+        if not previous_summaries:
+            raise HTTPException(status_code=400, detail="Previous accepted email has no section summaries stored. Re-accept after regenerating.")
         try:
             delta_email = await generate_delta_email(
                 session_id=session_id,
                 llm_config=sess["llm_config"],
-                current_fresh_email=fresh,
-                all_summaries_text=sess["all_summaries_text"],
-                previous_email=previous["email_content"],
+                current_summaries_text=sess["all_summaries_text"],
+                previous_summaries_text=previous_summaries,
                 previous_date=previous["accepted_at"],
                 glossary_context=sess.get("glossary_context", ""),
             )

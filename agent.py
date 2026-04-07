@@ -193,25 +193,25 @@ EMAIL_SUMMARY_USER = """Based on the following section‑by‑section summaries 
 DELTA_EMAIL_SYSTEM = """You are a senior supply chain executive drafting a **changes-only** email update for leadership and cross‑functional stakeholders of a global automotive parts manufacturer.
 
 You are provided with:
-1. The PREVIOUS accepted email (the last version sent to leadership).
-2. The CURRENT fresh email (generated from today's updated presentation, same format).
-3. The CURRENT section summaries (for factual grounding only — do NOT compare against these).
+1. The PREVIOUS section‑by‑section summaries (from the last accepted report).
+2. The CURRENT section‑by‑section summaries (from today's updated presentation).
+Both are structured identically — each section is labelled by name and slide range, containing bullet‑point facts extracted from the source slides.
 
-YOUR TASK: Compare the PREVIOUS email against the CURRENT email and report ONLY material factual differences. Do NOT repeat information that is unchanged.
+YOUR TASK: Compare the two sets of section summaries and draft an email that reports ONLY the material factual differences. Do NOT repeat information that is unchanged.
 
 CRITICAL RULES — READ CAREFULLY:
-1. ONLY report changes in UNDERLYING FACTS: numbers that changed, new items/risks/suppliers that appeared, items that disappeared, dates that shifted, statuses that changed (e.g. RED → GREEN, coverage extended from CW15 → CW18, cost estimate revised).
-2. Differences in wording, sentence structure, phrasing, level of detail, or formatting between the two emails DO NOT count as changes. Both emails describe the same underlying data — ignore all stylistic and structural variation.
-3. If a figure has changed, state the change with both old and new values: "Coverage for X extended from CW15 to CW18" or "Cost estimate revised from €2.1M to €2.5M".
-4. If an entirely new topic, product group, risk, or action appears in the current email that was absent from the previous email, include it under a "NEW" heading.
-5. If a previously reported risk or issue is absent from the current email, note it as resolved/closed.
+1. ONLY report changes in UNDERLYING FACTS: numbers that changed, new items/risks/suppliers that appeared, items that disappeared, dates that shifted, statuses that changed (e.g. RED → GREEN, coverage extended from CW15 → CW18, cost estimate revised from €2.1M to €2.5M).
+2. Differences in wording, sentence structure, phrasing, level of detail, bullet ordering, or formatting between the two sets of summaries DO NOT count as changes. Both describe the same underlying presentation data — ignore all stylistic and structural variation. Focus exclusively on whether the underlying facts, figures, and entities are the same.
+3. If a figure has changed, state the change with both old and new values: "Coverage for [component] extended from CW15 to CW18" or "Cost estimate revised from €2.1M to €2.5M".
+4. If an entirely new section, topic, product group, risk, supplier, or action appears in the current summaries that was completely absent from the previous summaries, include it under a "New Information" heading.
+5. If a previously reported risk, issue, or section is absent from the current summaries, note it as resolved/closed.
 6. DO NOT repeat unchanged facts. DO NOT rephrase existing information as if it were new.
 7. Where abbreviations appear, use the company glossary to expand them on first mention.
-8. If NO material factual differences exist between the two emails, your entire email body after the greeting should simply state: "No material changes since the last update." Do not pad the email with restatements of unchanged facts.
+8. If NO material factual differences exist between the two sets of summaries, your entire email body after the greeting MUST simply state: "No material changes since the last update." Do not pad the email with restatements of unchanged facts. A short email is the correct output when little has changed.
 
 STRUCTURE:
 - Start with "Dear all," and a one‑line context: "This update covers changes since the last report dated [previous date]."
-- Use markdown headings (###) to group changes logically — include ONLY sections where real factual changes exist:
+- Use markdown headings (###) to group changes logically — include ONLY headings where real factual changes exist:
   ### Key Changes & Developments
   ### New Risks / Escalations
   ### Improved / Resolved Items
@@ -221,22 +221,17 @@ STRUCTURE:
 - End with a brief sign‑off line.
 {glossary_block}"""
 
-DELTA_EMAIL_USER = """PREVIOUS ACCEPTED EMAIL (sent on {previous_date}):
---- START PREVIOUS EMAIL ---
-{previous_email}
---- END PREVIOUS EMAIL ---
+DELTA_EMAIL_USER = """PREVIOUS SECTION SUMMARIES (from the last accepted report, dated {previous_date}):
+--- START PREVIOUS SUMMARIES ---
+{previous_summaries}
+--- END PREVIOUS SUMMARIES ---
 
-CURRENT FRESH EMAIL (generated from today's presentation, same format — compare against this):
---- START CURRENT EMAIL ---
-{current_fresh_email}
---- END CURRENT EMAIL ---
+CURRENT SECTION SUMMARIES (from today's updated presentation):
+--- START CURRENT SUMMARIES ---
+{current_summaries}
+--- END CURRENT SUMMARIES ---
 
-CURRENT SECTION SUMMARIES (for factual grounding only — do NOT compare against these):
---- START SECTION SUMMARIES ---
-{all_summaries}
---- END SECTION SUMMARIES ---
-
-Draft the delta/changes-only email update. Report ONLY material factual differences between the previous and current emails. If nothing has materially changed, say so."""
+Draft the delta/changes-only email update. Report ONLY material factual differences between the previous and current summaries. If nothing has materially changed, say so."""
 
 REFINE_SYSTEM = """You are helping refine an executive summary of a Global Supply Chain Status Report. 
 The user will provide instructions for changes. Apply them precisely.
@@ -495,16 +490,14 @@ async def refine_email(session_id: str, llm_config: dict,
 async def generate_delta_email(
     session_id: str,
     llm_config: dict,
-    current_fresh_email: str,
-    all_summaries_text: str,
-    previous_email: str,
+    current_summaries_text: str,
+    previous_summaries_text: str,
     previous_date: str,
     glossary_context: str = "",
 ) -> str:
     """
-    Generate a delta/changes-only email by comparing the current fresh email
-    against the previously accepted email (same format → same format).
-    Section summaries are provided only for factual grounding.
+    Generate a delta/changes-only email by comparing current vs previous
+    all_summaries_text (same structured format, section-labelled, fact-dense).
     """
     llm = create_llm(llm_config)
     t0 = time.time()
@@ -514,9 +507,8 @@ async def generate_delta_email(
         SystemMessage(content=DELTA_EMAIL_SYSTEM.format(glossary_block=glossary_block)),
         HumanMessage(content=DELTA_EMAIL_USER.format(
             previous_date=previous_date,
-            previous_email=previous_email,
-            current_fresh_email=current_fresh_email,
-            all_summaries=all_summaries_text,
+            previous_summaries=previous_summaries_text,
+            current_summaries=current_summaries_text,
         )),
     ]
 
@@ -528,7 +520,7 @@ async def generate_delta_email(
 
     duration = (time.time() - t0) * 1000
     log_trace(session_id, "generate_delta_email",
-              f"Delta vs previous email from {previous_date}",
+              f"Delta vs previous summaries from {previous_date}",
               delta_email[:300], duration)
 
     return delta_email
