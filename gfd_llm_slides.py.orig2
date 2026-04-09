@@ -8,12 +8,6 @@ Stage 1 — LLM slide spec:
   slide specification — RAG colors, condensed cell text, groupings, KB coverage
   strings. The LLM makes ALL content decisions.
 
-  The row-level spec is generated via **chunked LLM calls** — product groups
-  are split into batches of ~8 rows, each sent to the LLM independently.
-  On per-chunk failure, a deterministic fallback computes RAG colors
-  arithmetically so no data is lost.  A lightweight overview LLM call
-  generates the global fields (title, CW columns, quarter label).
-
 Stage 2 — PPTX renderer:
   A thin "paint by numbers" renderer that converts the slide spec JSON into a
   python-pptx Presentation object that matches the corporate GFD template:
@@ -25,9 +19,9 @@ Stage 2 — PPTX renderer:
   - RAG-coloured CW cells (GREEN / AMBER / RED)
   - Corporate font (Arial) and colour scheme
 
-If the overview LLM call also fails, a fully deterministic fallback computes
-everything arithmetically from the integer coverage CW fields produced by the
-extractor, so the user always gets a working dashboard even on LLM error.
+If Stage 1 fails, a deterministic fallback computes RAG colors arithmetically
+from the integer coverage CW fields produced by the extractor, so the user
+always gets a working dashboard even on LLM error.
 
 When a corporate template PPTX is available, it is loaded as the base
 presentation so that theme colours, logos, and slide-master styling are
@@ -136,9 +130,9 @@ _Q_COL         = 10         # quarter column index
 _N_FIXED_LEFT  = 4          # text columns before CW band (0–3)
 _N_FIXED_RIGHT = 3          # text columns after CW band (11–13)
 
-# Max data rows per slide (excluding 2-row header).
-# Reduced from 24 to 10 for readability — additional rows spill to new slides.
-_MAX_ROWS_PER_SLIDE = 10
+# Max data rows per slide (excluding 2-row header).  The template comfortably
+# fits ~24 data rows within 4.8 in of table height.
+_MAX_ROWS_PER_SLIDE = 24
 
 # Header row height
 _HDR_ROW_H = Emu(231700)    # row 0 — 0.253 in
@@ -297,23 +291,22 @@ def _add_slide(prs: Presentation, layout) -> Any:
     return prs.slides.add_slide(prs.slide_layouts[blank_idx])
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Stage 1: LLM slide spec  (chunked)
-# ═══════════════════════════════════════════════════════════════════════
+# ─── Stage 1: LLM slide spec ────────────────────────────────────────
 
-# ─── Row-level chunked LLM generation ────────────────────────────────
-
-_ROW_CHUNK_SIZE = 8    # rows per LLM call
-
-_ROWS_SYSTEM = """\
+_SLIDES_SYSTEM = """\
 You are a Chief Supply Chain Officer designing a Global Fulfilment Dashboard
-presentation for a board-level audience.  You are given a SUBSET of product-group
-rows extracted from the Dashboard_Update worksheet plus the current calendar week.
+presentation for a board-level audience.  You are given JSON extracted from
+the Dashboard_Update worksheet.  Generate a COMPLETE slide specification as JSON.
 
-For each input row, produce ONE output row with EXACTLY these fields:
+═══ DASHBOARD TABLE DESIGN ═══
 
+The dashboard is a SINGLE TABLE containing ALL product groups.  Each row represents
+one plant-level risk item.  Rows belonging to the same product group are listed
+consecutively (they will be visually grouped via vertical merge on the slide).
+
+COLUMNS (in order):
   product_group  — "Name\\n(code)" format, e.g. "Compressors\\n(11)".
-                   Every row in the same product group must have the IDENTICAL value.
+                   Every row in the same group must have the IDENTICAL value.
   plant          — Plant location code, ≤ 15 chars
   customer       — Customer or channel name, ≤ 120 chars.  May be empty.
   kb_coverage    — KB coverage to customer as compact text (e.g. "CW17/18\\nCW21").
@@ -323,14 +316,16 @@ For each input row, produce ONE output row with EXACTLY these fields:
                    to a RAG colour: "GREEN", "AMBER", "RED", or "GREY".
   quarter_color  — Single RAG colour for the quarter column.
   supplier       — Supplier name or description, ≤ 120 chars
-  comment        — Action / comment text.  The source field is an incremental
-                   log where updates are appended every few days, so it can be
-                   very long.  SUMMARISE it into 2–4 concise bullet points
-                   (use "; " as bullet separator) that a board member can scan
-                   in seconds.  Prioritise the MOST RECENT updates and current
-                   status over older history.  Include specific CW numbers,
-                   dates, and quantities where available.  Target ≤ 120 chars.
+  comment        — Action / comment text.  Preserve the FULL text — do NOT
+                   truncate or summarise.  Include every detail from the source.
   fm_detail      — Force Majeure detail letter status, ≤ 60 chars
+
+CW COLUMNS:
+  Exactly 6 consecutive calendar-week integers starting from the current CW.
+  Handle year-end wrap (e.g. CW50,51,52,1,2,3).
+
+QUARTER:
+  The quarter that follows the 6-week CW window (e.g. "Q2" or "Q3/2026").
 
 RAG COLOUR COMPUTATION (per row, per CW column):
   Given coverage_without_mitigation_cw (W) and coverage_with_mitigation_cw (M):
@@ -355,9 +350,21 @@ CRITICAL JSON RULES:
     kb_coverage "CW17\\nCW21").  This is the two-character sequence backslash-n,
     NOT a literal newline.
   • No trailing commas before }} or ]].
-  • The output must be parseable by a strict JSON parser (Python json.loads).
+  • The output must be parseable by a strict JSON parser (Python json.loads)
+    without any post-processing.
 
 {{
+  "presentation_title": "Global Fulfilment Dashboard",
+  "current_cw": "CW13/2026",
+  "cw_columns": [13, 14, 15, 16, 17, 18],
+  "quarter_label": "Q2",
+  "overall_risk": "HIGH",
+  "stats": {{
+    "total_items": 24,
+    "red_count": 12,
+    "amber_count": 5,
+    "green_count": 7
+  }},
   "rows": [
     {{
       "product_group": "Compressors\\n(11)",
@@ -367,337 +374,41 @@ CRITICAL JSON RULES:
       "cw_colors": {{"13":"GREEN","14":"GREEN","15":"GREEN","16":"GREEN","17":"GREEN","18":"RED"}},
       "quarter_color": "RED",
       "supplier": "Supplier Corp.",
-      "comment": "Dual source active CW14; air freight bridge 3 wks; weekly escalation with supplier VP Ops",
+      "comment": "Dual source activation by CW14; emergency air freight bridge 3 weeks; weekly escalation calls with supplier VP Ops",
       "fm_detail": "sent"
+    }},
+    {{
+      "product_group": "Compressors\\n(11)",
+      "plant": "LIB",
+      "customer": "BMW Group",
+      "kb_coverage": "CW21",
+      "cw_colors": {{"13":"GREEN","14":"GREEN","15":"GREEN","16":"GREEN","17":"GREEN","18":"GREEN"}},
+      "quarter_color": "RED",
+      "supplier": "",
+      "comment": "",
+      "fm_detail": ""
     }}
   ]
 }}
 
 IMPORTANT:
-  • Your output MUST contain EXACTLY as many rows as stated in the user message.
-  • NEVER merge, deduplicate, skip, or summarise rows.
+  • EVERY data row from the extraction must appear — skip nothing.
   • Rows of the same product group MUST be listed consecutively with the
-    EXACT SAME product_group string value.
+    EXACT SAME product_group string value (the renderer uses this to merge cells).
+  • overall_risk = worst single RAG across ALL rows and CW columns.
+    Map: any RED → "CRITICAL" or "HIGH", all AMBER → "MEDIUM", all GREEN → "LOW".
+  • stats.red_count / amber_count / green_count = number of rows whose worst CW
+    colour is RED / AMBER / GREEN respectively.
 {glossary_block}"""
 
-_ROWS_USER = """\
+_SLIDES_USER = """\
 Today: {today}
 Current calendar week: {current_cw}
-CW columns to use: {cw_columns}
-Quarter label: {quarter_label}
 
-Below are EXACTLY {n_rows} extracted rows (chunk {chunk_idx} of {total_chunks}).
-Your output must contain EXACTLY {n_rows} row entries.
-Do NOT merge, skip, or summarise any rows even if they look similar.
+Generate the complete dashboard slide specification from this extracted data.
+Use exactly 6 CW columns starting from the current week number.
 
-{rows_json}"""
-
-
-def _compute_cw_columns_and_quarter(current_cw_str: str) -> tuple[list[int], str, int, int]:
-    """
-    Compute the 6 CW column numbers and quarter label from a "CWnn/yyyy" string.
-
-    Returns (cw_columns, quarter_label, cw_start, cw_year).
-    """
-    import re as _re
-    m = _re.match(r"CW(\d+)/(\d+)", current_cw_str)
-    if m:
-        cw_start, cw_year = int(m.group(1)), int(m.group(2))
-    else:
-        iso = datetime.now().isocalendar()
-        cw_start, cw_year = iso.week, iso.year
-
-    cw_columns: list[int] = []
-    for i in range(6):
-        w = ((cw_start - 1 + i) % 52) + 1
-        cw_columns.append(w)
-
-    last_cw = cw_columns[-1]
-    q_num = (last_cw - 1) // 13 + 2
-    q_label = f"Q{min(q_num, 4)}"
-
-    return cw_columns, q_label, cw_start, cw_year
-
-
-def _flatten_extracted_rows(extracted: dict) -> list[dict]:
-    """
-    Flatten product_groups → rows list, tagging each row with its group
-    code and description for the LLM chunk context.
-    """
-    flat: list[dict] = []
-    for pg in extracted.get("product_groups", []):
-        code = pg.get("product_family_code", "")
-        desc = pg.get("product_family_desc", "Unknown")
-        for row in pg.get("rows", []):
-            row_copy = dict(row)
-            row_copy["_pg_code"] = code
-            row_copy["_pg_desc"] = desc
-            flat.append(row_copy)
-    return flat
-
-
-def _chunk_rows(
-    rows: list[dict],
-    chunk_size: int = _ROW_CHUNK_SIZE,
-) -> list[list[dict]]:
-    """Split a flat list of row dicts into chunks of chunk_size."""
-    return [
-        rows[i: i + chunk_size]
-        for i in range(0, len(rows), chunk_size)
-    ]
-
-
-def _build_rows_deterministic_for_chunk(
-    chunk_rows: list[dict],
-    cw_columns: list[int],
-    q_label: str,
-) -> list[dict]:
-    """
-    Deterministic fallback: build slide-spec rows from raw extracted data
-    using arithmetic RAG logic.  Used when an LLM chunk fails.
-    """
-    q_num_match = None
-    try:
-        q_num_match = int(q_label.replace("Q", ""))
-    except (ValueError, TypeError):
-        pass
-
-    result: list[dict] = []
-    for row in chunk_rows:
-        code = row.get("_pg_code", "")
-        desc = row.get("_pg_desc", "Unknown")
-        pg_label = f"{desc}\n({code})" if code else desc
-
-        cov_wo: int | None = row.get("coverage_without_mitigation_cw")
-        cov_w:  int | None = row.get("coverage_with_mitigation_cw")
-
-        cw_colors = {str(cw): _cw_color(cw, cov_wo, cov_w) for cw in cw_columns}
-
-        # Quarter color
-        if q_num_match is not None:
-            quarter_weeks = range((q_num_match - 2) * 13 + 1, (q_num_match - 1) * 13 + 1)
-            quarter_colors = [_cw_color(w, cov_wo, cov_w) for w in quarter_weeks if 1 <= w <= 52]
-            quarter_color = _worst_rag(quarter_colors) if quarter_colors else _worst_rag(list(cw_colors.values()))
-        else:
-            quarter_color = _worst_rag(list(cw_colors.values()))
-
-        # KB coverage text
-        parts = []
-        if cov_wo is not None:
-            parts.append(f"CW{cov_wo}")
-        if cov_w is not None and cov_w != cov_wo:
-            parts.append(f"CW{cov_w}")
-        kb_coverage = "\n".join(parts) if parts else ""
-
-        result.append({
-            "product_group":  pg_label,
-            "plant":          (row.get("plant_location") or "")[:15],
-            "customer":       (row.get("customer_affected") or "")[:120],
-            "kb_coverage":    kb_coverage,
-            "cw_colors":      cw_colors,
-            "quarter_color":  quarter_color,
-            "supplier":       (row.get("supplier_text") or "")[:120],
-            "comment":        (row.get("action_comment") or "")[:120],
-            "fm_detail":      str(row.get("customer_informed") or "")[:60],
-        })
-
-    return result
-
-
-async def _generate_rows_chunk(
-    chunk_rows_raw: list[dict],
-    llm: AzureChatOpenAI,
-    system_prompt: str,
-    today: str,
-    current_cw: str,
-    cw_columns: list[int],
-    quarter_label: str,
-    session_id: str,
-    llm_config: dict,
-    chunk_idx: int,
-    total_chunks: int,
-) -> list[dict] | None:
-    """
-    Send a single chunk of extracted rows to the LLM for slide-row
-    generation.  Returns the list of row dicts, or None on failure
-    (caller falls back to deterministic).
-    """
-    chunk_label = f"rows_chunk {chunk_idx + 1}/{total_chunks}"
-    n = len(chunk_rows_raw)
-    t0 = time.time()
-
-    # Strip internal keys before sending to LLM
-    rows_for_llm = [{k: v for k, v in r.items() if not k.startswith("_")}
-                    for r in chunk_rows_raw]
-    # Re-attach product group info as visible fields so LLM knows the grouping
-    for i, r in enumerate(rows_for_llm):
-        r["product_family_code"] = chunk_rows_raw[i].get("_pg_code", "")
-        r["product_family_desc"] = chunk_rows_raw[i].get("_pg_desc", "")
-
-    rows_json = json.dumps(rows_for_llm, indent=2, ensure_ascii=False)
-
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=_ROWS_USER.format(
-            today=today,
-            current_cw=current_cw,
-            cw_columns=json.dumps(cw_columns),
-            quarter_label=quarter_label,
-            n_rows=n,
-            chunk_idx=f"{chunk_idx + 1}",
-            total_chunks=total_chunks,
-            rows_json=rows_json,
-        )),
-    ]
-
-    try:
-        response = await llm.ainvoke(messages)
-        raw = response.content.strip()
-
-        # Dump raw response for debugging
-        try:
-            dump_path = (
-                Path(__file__).parent / "uploads"
-                / f"{session_id}_gfd_rows_{chunk_idx + 1}of{total_chunks}_raw.txt"
-            )
-            dump_path.write_text(raw, encoding="utf-8")
-        except Exception:
-            pass
-
-        parsed = _parse_llm_json(raw, session_id=session_id, attempt=chunk_idx)
-        rows = parsed.get("rows", [])
-
-        usage = response.response_metadata.get("token_usage", {})
-        log_tokens(session_id, f"gfd_llm_{chunk_label}", usage,
-                   llm_config.get("azure_deployment", ""))
-
-        duration = (time.time() - t0) * 1000
-        print(f"[GFD DEBUG] {chunk_label}: sent {n} rows → "
-              f"got {len(rows)} rows back ({duration:.0f}ms)")
-
-        if len(rows) < n:
-            print(f"[GFD WARNING] {chunk_label}: lost {n - len(rows)} rows")
-
-        log_trace(session_id, f"gfd_llm_{chunk_label}",
-                  f"Input: {n} rows",
-                  f"Got {len(rows)} spec rows ({duration:.0f}ms)",
-                  duration)
-        return rows
-
-    except Exception as exc:
-        duration = (time.time() - t0) * 1000
-        print(f"[GFD ERROR] {chunk_label}: {str(exc)[:120]}")
-        log_trace(session_id, f"gfd_llm_{chunk_label}",
-                  f"Input: {n} rows",
-                  f"ERROR: {str(exc)[:120]}",
-                  duration, {"error": True})
-        return None
-
-
-async def _build_rows_llm(
-    extracted: dict,
-    llm_config: dict,
-    session_id: str,
-    cw_columns: list[int],
-    quarter_label: str,
-    glossary_context: str = "",
-    chunk_size: int = _ROW_CHUNK_SIZE,
-) -> list[dict]:
-    """
-    Build slide-spec rows via chunked LLM calls.
-
-    1. Flatten product_groups into a row list.
-    2. Split into chunks of chunk_size.
-    3. Send each chunk to the LLM.
-    4. On per-chunk failure, fall back to deterministic mapping for
-       that chunk's rows.
-    5. Merge all chunk results.
-    """
-    flat_rows = _flatten_extracted_rows(extracted)
-
-    if not flat_rows:
-        print("[GFD DEBUG] No rows to process — returning empty list")
-        return []
-
-    chunks = _chunk_rows(flat_rows, chunk_size)
-    total_chunks = len(chunks)
-    today = date.today().isoformat()
-    current_cw = extracted.get("current_cw", "CW??/????")
-
-    print(f"[GFD DEBUG] ── Row spec: {len(flat_rows)} rows → "
-          f"{total_chunks} chunk(s) of ≤{chunk_size} ──")
-
-    glossary_block = (
-        f"\n\nCOMPANY GLOSSARY:\n{glossary_context}" if glossary_context else ""
-    )
-    system_prompt = _ROWS_SYSTEM.format(glossary_block=glossary_block)
-
-    llm = _create_llm(llm_config, max_tokens=16000)
-    all_rows: list[dict] = []
-    failed_chunks = 0
-
-    for i, chunk in enumerate(chunks):
-        result = await _generate_rows_chunk(
-            chunk, llm, system_prompt, today, current_cw,
-            cw_columns, quarter_label,
-            session_id, llm_config, i, total_chunks,
-        )
-        if result is not None and len(result) > 0:
-            all_rows.extend(result)
-        else:
-            # Per-chunk deterministic fallback
-            failed_chunks += 1
-            fallback = _build_rows_deterministic_for_chunk(
-                chunk, cw_columns, quarter_label,
-            )
-            all_rows.extend(fallback)
-            print(f"[GFD DEBUG] rows_chunk {i + 1}/{total_chunks}: "
-                  f"using deterministic fallback ({len(fallback)} rows)")
-
-    if failed_chunks:
-        print(f"[GFD WARNING] {failed_chunks}/{total_chunks} row chunk(s) "
-              f"fell back to deterministic mapping")
-
-    print(f"[GFD DEBUG] ── Row spec complete: {len(all_rows)} rows "
-          f"({total_chunks} chunks, {failed_chunks} fallback) ──")
-
-    return all_rows
-
-
-def _compute_stats_from_rows(rows: list[dict]) -> tuple[dict, str]:
-    """
-    Compute stats and overall_risk deterministically from the merged row list.
-    Returns (stats_dict, overall_risk_string).
-    """
-    red_count = 0
-    amber_count = 0
-    green_count = 0
-
-    for row in rows:
-        cw_colors = row.get("cw_colors", {})
-        worst = _worst_rag(list(cw_colors.values()))
-        if worst == "RED":
-            red_count += 1
-        elif worst == "AMBER":
-            amber_count += 1
-        else:
-            green_count += 1
-
-    total = len(rows)
-    if red_count > 0:
-        overall_risk = "HIGH"
-    elif amber_count > 0:
-        overall_risk = "MEDIUM"
-    else:
-        overall_risk = "LOW"
-
-    stats = {
-        "total_items":  total,
-        "red_count":    red_count,
-        "amber_count":  amber_count,
-        "green_count":  green_count,
-    }
-    return stats, overall_risk
+{extracted_json}"""
 
 
 async def llm_generate_slide_spec(
@@ -707,69 +418,75 @@ async def llm_generate_slide_spec(
     glossary_context: str = "",
 ) -> dict:
     """
-    Stage 1: Generate a complete slide specification from extracted data.
+    Stage 1: LLM generates a complete slide specification from extracted data.
 
-    Uses chunked LLM calls for the per-row spec (RAG colors, condensed
-    text, product-group labels).  Global fields (CW columns, quarter label)
-    and aggregate fields (stats, overall_risk) are computed deterministically.
-
-    Falls back to a fully deterministic spec on catastrophic error.
+    Returns a dict with a "rows" list.  Falls back to a deterministic spec on error.
     """
+    llm = _create_llm(llm_config, max_tokens=8192)
     t0 = time.time()
+    today = date.today().isoformat()
     current_cw = extracted.get("current_cw", "CW??/????")
-    n_input_pgs = len(extracted.get("product_groups", []))
-    n_input_rows = sum(
-        len(pg.get("rows", []))
-        for pg in extracted.get("product_groups", [])
-    )
-    print(f"\n[GFD DEBUG] ═══ Stage 3: LLM slide spec (chunked) ═══")
-    print(f"[GFD DEBUG] Input: {n_input_pgs} product groups, "
-          f"{n_input_rows} rows, CW={current_cw}")
 
-    # ── Compute global fields deterministically ──────────────────────
-    cw_columns, quarter_label, cw_start, cw_year = \
-        _compute_cw_columns_and_quarter(current_cw)
+    glossary_block = (
+        f"\n\nCOMPANY GLOSSARY:\n{glossary_context}" if glossary_context else ""
+    )
+
+    clean = {k: v for k, v in extracted.items() if not k.startswith("_")}
+    extracted_json = json.dumps(clean, indent=2, ensure_ascii=False)
+
+    messages = [
+        SystemMessage(content=_SLIDES_SYSTEM.format(
+            today=today,
+            glossary_block=glossary_block,
+        )),
+        HumanMessage(content=_SLIDES_USER.format(
+            today=today,
+            current_cw=current_cw,
+            extracted_json=extracted_json,
+        )),
+    ]
 
     try:
-        # ── Build rows via chunked LLM ──────────────────────────────
-        all_rows = await _build_rows_llm(
-            extracted, llm_config, session_id,
-            cw_columns, quarter_label, glossary_context,
-        )
+        response = await llm.ainvoke(messages)
+        raw = response.content.strip()
 
-        # ── Compute stats from merged rows ──────────────────────────
-        stats, overall_risk = _compute_stats_from_rows(all_rows)
+        # ── Dump raw LLM response for debugging ──────────────────
+        try:
+            raw_dump_path = Path(__file__).parent / "uploads" / f"{session_id}_llm_slidespec_raw.txt"
+            raw_dump_path.write_text(raw, encoding="utf-8")
+            print(f"[GFD DEBUG] Raw slide-spec LLM response saved: {raw_dump_path} "
+                  f"({len(raw):,} chars)")
+        except Exception as dump_exc:
+            print(f"[GFD DEBUG] Could not save raw slide-spec response: {dump_exc}")
 
-        total_duration = (time.time() - t0) * 1000
-        print(f"[GFD DEBUG] Slide spec complete: {len(all_rows)} rows, "
-              f"risk={overall_risk} ({total_duration:.0f}ms total)")
+        spec: dict = _parse_llm_json(raw, session_id=session_id)
 
-        spec = {
-            "presentation_title": "Global Fulfilment Dashboard",
-            "current_cw":         current_cw,
-            "cw_columns":         cw_columns,
-            "quarter_label":      quarter_label,
-            "overall_risk":       overall_risk,
-            "stats":              stats,
-            "rows":               all_rows,
-        }
+        usage = response.response_metadata.get("token_usage", {})
+        log_tokens(session_id, "gfd_llm_slide_spec", usage, llm_config.get("azure_deployment", ""))
 
+        n_rows = len(spec.get("rows", []))
+        duration = (time.time() - t0) * 1000
         log_trace(
             session_id, "gfd_llm_slide_spec",
-            f"Input: {n_input_pgs} product groups, {n_input_rows} rows",
-            f"Spec: {len(all_rows)} rows, risk={overall_risk} "
-            f"(chunked, {total_duration:.0f}ms)",
-            total_duration,
+            f"Input: {len(extracted.get('product_groups', []))} product groups",
+            f"Generated spec with {n_rows} rows",
+            duration,
         )
         return spec
 
+    except json.JSONDecodeError as exc:
+        duration = (time.time() - t0) * 1000
+        log_trace(session_id, "gfd_llm_slide_spec",
+                  "Generating slide spec",
+                  f"JSON PARSE ERROR — using deterministic fallback: {str(exc)[:100]}",
+                  duration, {"error": True, "fallback": True})
+        return _deterministic_fallback_spec(extracted)
+
     except Exception as exc:
         duration = (time.time() - t0) * 1000
-        print(f"[GFD ERROR] Slide spec generation failed — "
-              f"using deterministic fallback: {str(exc)[:100]}")
         log_trace(session_id, "gfd_llm_slide_spec",
-                  "Generating slide spec (chunked)",
-                  f"ERROR — using fallback: {str(exc)[:100]}",
+                  "Generating slide spec",
+                  f"ERROR — using deterministic fallback: {str(exc)[:100]}",
                   duration, {"error": True, "fallback": True})
         return _deterministic_fallback_spec(extracted)
 
@@ -801,14 +518,23 @@ def _deterministic_fallback_spec(extracted: dict) -> dict:
     import re as _re
 
     current_cw_str = extracted.get("current_cw", "CW1/2026")
-    cw_columns, q_label, cw_start, cw_year = \
-        _compute_cw_columns_and_quarter(current_cw_str)
+    m = _re.match(r"CW(\d+)/(\d+)", current_cw_str)
+    if m:
+        cw_start, cw_year = int(m.group(1)), int(m.group(2))
+    else:
+        iso = datetime.now().isocalendar()
+        cw_start, cw_year = iso.week, iso.year
 
-    q_num_match = None
-    try:
-        q_num_match = int(q_label.replace("Q", ""))
-    except (ValueError, TypeError):
-        pass
+    # 6 consecutive CW numbers with year-end wrap
+    cw_columns: list[int] = []
+    for i in range(6):
+        w = ((cw_start - 1 + i) % 52) + 1
+        cw_columns.append(w)
+
+    # Quarter label
+    last_cw = cw_columns[-1]
+    q_num = (last_cw - 1) // 13 + 2
+    q_label = f"Q{min(q_num, 4)}"
 
     all_rows: list[dict] = []
     red_count = 0
@@ -828,12 +554,9 @@ def _deterministic_fallback_spec(extracted: dict) -> dict:
             all_colors = list(cw_colors.values())
 
             # Quarter color
-            if q_num_match is not None:
-                quarter_weeks = range((q_num_match - 2) * 13 + 1, (q_num_match - 1) * 13 + 1)
-                quarter_colors = [_cw_color(w, cov_wo, cov_w) for w in quarter_weeks if 1 <= w <= 52]
-                quarter_color = _worst_rag(quarter_colors) if quarter_colors else _worst_rag(all_colors)
-            else:
-                quarter_color = _worst_rag(all_colors)
+            quarter_weeks = range((q_num - 2) * 13 + 1, (q_num - 1) * 13 + 1)
+            quarter_colors = [_cw_color(w, cov_wo, cov_w) for w in quarter_weeks if 1 <= w <= 52]
+            quarter_color = _worst_rag(quarter_colors) if quarter_colors else _worst_rag(all_colors)
 
             # KB coverage text
             parts = []
@@ -859,7 +582,7 @@ def _deterministic_fallback_spec(extracted: dict) -> dict:
                 "cw_colors":      cw_colors,
                 "quarter_color":  quarter_color,
                 "supplier":       (row.get("supplier_text") or "")[:120],
-                "comment":        (row.get("action_comment") or "")[:120],
+                "comment":        (row.get("action_comment") or ""),
                 "fm_detail":      str(row.get("customer_informed") or "")[:60],
             })
 
@@ -888,9 +611,7 @@ def _deterministic_fallback_spec(extracted: dict) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Stage 2: PPTX renderer  (unchanged except _MAX_ROWS_PER_SLIDE = 10)
-# ═══════════════════════════════════════════════════════════════════════
+# ─── Stage 2: PPTX renderer ────────────────────────────────────────
 
 def _compute_product_group_ranges(rows: list[dict]) -> list[tuple[int, int, str]]:
     """
