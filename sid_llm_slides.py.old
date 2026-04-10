@@ -97,10 +97,6 @@ _H  = Inches(5.625)
 
 FONT = "Arial"
 
-# Max supplier-detail rows per Slide 2 page.  If there are more rows,
-# additional slides are generated automatically.
-_MAX_DETAIL_ROWS_PER_SLIDE = 12
-
 
 # ─── Low-level python-pptx helpers ──────────────────────────────────
 
@@ -276,9 +272,7 @@ _SLIDES_SYSTEM = """\
 You are a Chief Procurement Officer designing a Supplier Impact Dashboard
 presentation for a board-level audience. You are given JSON extracted from
 the KB Input worksheet of a Supplier Impact Tracking file.
-Generate the SLIDE 1 (overview) specification as JSON.
-Slide 2 (supplier fulfillment detail) will be built deterministically — do NOT
-include a "supplier_details" array in your output.
+Generate a COMPLETE two-slide specification as JSON.
 
 ═══ SLIDE 1 — SUPPLIER IMPACT OVERVIEW ═══
 
@@ -318,6 +312,20 @@ This slide has FOUR sections:
    "15 of 48 suppliers confirmed as impacted. Sub-supplier dependencies
    remain under evaluation."
 
+═══ SLIDE 2 — SUPPLIER FULFILLMENT DETAIL ═══
+
+One row per impacted supplier with columns:
+  supplier_name, host, material_planner, sda, coverage_date, coverage_after_actions,
+  affected_product, customer, remarks
+
+Content rules:
+- coverage_date: use the date field or coverage date, format DD.MM.YYYY
+- coverage_after_actions: qualitative (e.g. "No visibility", "ICO available",
+  "Backup identified", "5 days additional")
+- affected_product: from device_product_line field
+- customer: combine dom_customer_name and ico_customer_name
+- remarks: full root cause / mitigation details. Preserve ALL text — do NOT truncate.
+
 ═══ OUTPUT FORMAT ═══
 
 Respond with ONLY valid JSON — no markdown fences, no explanation text.
@@ -355,289 +363,36 @@ CRITICAL JSON RULES:
     }}
   ],
   "contextual_notes": "15 of 48 suppliers confirmed impacted. Sub-supplier dependencies under evaluation.",
+  "supplier_details": [
+    {{
+      "supplier_name": "Supplier Corp.",
+      "host": "Person A",
+      "material_planner": "Person B",
+      "sda": "Person C",
+      "coverage_date": "25.03.2026",
+      "coverage_after_actions": "ICO available until CW18",
+      "affected_product": "Compressor, Actuator",
+      "customer": "BMW, Mercedes",
+      "remarks": "Root cause: gas supply disruption; dual sourcing under evaluation; interim air freight"
+    }}
+  ],
   "overall_severity": "HIGH",
   "footer_text": "T/SC SDA"
 }}
 
 IMPORTANT:
-  • Include ALL affected suppliers (severity R or Y) in the affected_suppliers table.
+  • Include ALL affected suppliers in both tables.
   • overall_severity = "CRITICAL" if any severity R, "HIGH" if mix R+Y,
     "MEDIUM" if all Y, "LOW" if all G.
-  • Do NOT include "supplier_details" — it will be built from the source data directly.
 {glossary_block}"""
 
 _SLIDES_USER = """\
 Today: {today}
 Current calendar week: {current_cw}
 
-Generate the Slide 1 (overview) specification from this extracted data.
-The data contains {n_suppliers} suppliers total.
-Do NOT include "supplier_details" — Slide 2 is built separately.
+Generate the complete two-slide specification from this extracted data.
 
 {extracted_json}"""
-
-
-# ─── Slide 2: Chunked LLM detail generation ─────────────────────────
-
-_DETAIL_CHUNK_SIZE = 8
-
-_DETAIL_SYSTEM = """\
-You are a supply chain analyst preparing the Supplier Fulfillment Detail
-table for a board-level dashboard.
-
-You will receive a JSON array of supplier records extracted from the KB Input
-worksheet.  For EACH supplier, produce one detail row with EXACTLY these fields:
-
-  supplier_name  — from "vendor" field
-  host           — from "category_buyer" field
-  material_planner — from "material_planner" field if available, else ""
-  sda            — from "sda" field if available, else ""
-  coverage_date  — from "date" field, format DD.MM.YYYY
-  coverage_after_actions — interpret from "current_fuel_coverage",
-      "al_other_rm_coverage_days", "total_coverage_fg_days", and "remarks".
-      Produce a concise qualitative statement, e.g.:
-        "No visibility", "ICO available until CW18", "5 days additional (air freight)",
-        "Backup source identified", "Stock until 15.04", "2 weeks via spot buy"
-      If no coverage information exists, use "No visibility".
-  affected_product — from "device_product_line" field
-  customer       — combine "dom_customer_name" and "ico_customer_name",
-      separated by "; ".  Omit blanks.
-  remarks        — synthesise from "remarks", "process_impacted", and any other
-      context.  Preserve key facts (root cause, mitigation status, timeline).
-      Flatten to a single line using "; " as separator.  Do NOT truncate.
-
-═══ RULES ═══
-  • Output EXACTLY as many rows as there are suppliers in the input —
-    one row per input supplier.  Never merge, skip, or invent rows.
-    The user message states the exact count.
-  • Respond with ONLY valid JSON — no markdown fences, no explanation.
-  • No literal newlines/tabs inside string values — use "; " instead.
-  • No trailing commas.
-
-OUTPUT FORMAT:
-{{
-  "supplier_details": [
-    {{
-      "supplier_name": "...",
-      "host": "...",
-      "material_planner": "...",
-      "sda": "...",
-      "coverage_date": "...",
-      "coverage_after_actions": "...",
-      "affected_product": "...",
-      "customer": "...",
-      "remarks": "..."
-    }}
-  ]
-}}
-{glossary_block}"""
-
-_DETAIL_USER = """\
-Today: {today}
-Current calendar week: {current_cw}
-
-Below are EXACTLY {n_suppliers} supplier records (chunk {chunk_idx} of {total_chunks}).
-Your output must contain EXACTLY {n_suppliers} supplier_details entries.
-
-{suppliers_json}"""
-
-
-def _build_supplier_details_deterministic(suppliers: list[dict]) -> list[dict]:
-    """
-    Deterministic fallback: build supplier_details from raw supplier data
-    via direct field remapping.  Used when an LLM chunk fails.
-    """
-    details: list[dict] = []
-    for s in suppliers:
-        customers = "; ".join(filter(None, [
-            str(s.get("dom_customer_name", "") or "").strip(),
-            str(s.get("ico_customer_name", "") or "").strip(),
-        ]))
-
-        cov_after = str(s.get("current_fuel_coverage", "") or "").strip()
-        if not cov_after:
-            al_cov = s.get("al_other_rm_coverage_days")
-            if al_cov is not None and str(al_cov).strip().lower() not in (
-                "", "nan", "none", "null", "n/a",
-            ):
-                cov_after = f"{al_cov} days (AL/other RM)"
-        if not cov_after:
-            cov_after = "No visibility"
-
-        details.append({
-            "supplier_name": str(s.get("vendor", "") or "").strip(),
-            "host": str(s.get("category_buyer", "") or "").strip(),
-            "material_planner": str(s.get("material_planner", "") or "").strip(),
-            "sda": str(s.get("sda", "") or "").strip(),
-            "coverage_date": str(s.get("date", "") or "").strip(),
-            "coverage_after_actions": cov_after,
-            "affected_product": str(s.get("device_product_line", "") or "").strip(),
-            "customer": customers,
-            "remarks": str(s.get("remarks", "") or "").strip(),
-        })
-
-    return details
-
-
-def _chunk_supplier_list(
-    suppliers: list[dict],
-    chunk_size: int = _DETAIL_CHUNK_SIZE,
-) -> list[list[dict]]:
-    """Split a list of supplier dicts into chunks of chunk_size."""
-    return [
-        suppliers[i : i + chunk_size]
-        for i in range(0, len(suppliers), chunk_size)
-    ]
-
-
-async def _generate_detail_chunk(
-    chunk_suppliers: list[dict],
-    llm: AzureChatOpenAI,
-    system_prompt: str,
-    today: str,
-    current_cw: str,
-    session_id: str,
-    llm_config: dict,
-    chunk_idx: int,
-    total_chunks: int,
-) -> list[dict] | None:
-    """
-    Send a single chunk of suppliers to the LLM for Slide 2 detail
-    generation.  Returns the list of supplier_details dicts, or None
-    on failure (caller falls back to deterministic).
-    """
-    chunk_label = f"detail_chunk {chunk_idx + 1}/{total_chunks}"
-    n = len(chunk_suppliers)
-    t0 = time.time()
-
-    suppliers_json = json.dumps(chunk_suppliers, indent=2, ensure_ascii=False)
-
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=_DETAIL_USER.format(
-            today=today,
-            current_cw=current_cw,
-            n_suppliers=n,
-            chunk_idx=f"{chunk_idx + 1}",
-            total_chunks=total_chunks,
-            suppliers_json=suppliers_json,
-        )),
-    ]
-
-    try:
-        response = await llm.ainvoke(messages)
-        raw = response.content.strip()
-
-        # Dump raw response for debugging
-        try:
-            dump_path = (
-                Path(__file__).parent / "uploads"
-                / f"{session_id}_sid_detail_{chunk_idx + 1}of{total_chunks}_raw.txt"
-            )
-            dump_path.write_text(raw, encoding="utf-8")
-        except Exception:
-            pass
-
-        parsed = _parse_llm_json(raw, session_id=session_id, attempt=chunk_idx)
-        details = parsed.get("supplier_details", [])
-
-        usage = response.response_metadata.get("token_usage", {})
-        log_tokens(session_id, f"sid_llm_{chunk_label}", usage,
-                   llm_config.get("azure_deployment", ""))
-
-        duration = (time.time() - t0) * 1000
-        print(f"[SID DEBUG] {chunk_label}: sent {n} suppliers → "
-              f"got {len(details)} detail rows back ({duration:.0f}ms)")
-
-        if len(details) < n:
-            print(f"[SID WARNING] {chunk_label}: lost "
-                  f"{n - len(details)} rows")
-
-        log_trace(session_id, f"sid_llm_{chunk_label}",
-                  f"Input: {n} suppliers",
-                  f"Got {len(details)} detail rows ({duration:.0f}ms)",
-                  duration)
-        return details
-
-    except Exception as exc:
-        duration = (time.time() - t0) * 1000
-        print(f"[SID ERROR] {chunk_label}: {str(exc)[:120]}")
-        log_trace(session_id, f"sid_llm_{chunk_label}",
-                  f"Input: {n} suppliers",
-                  f"ERROR: {str(exc)[:120]}",
-                  duration, {"error": True})
-        return None
-
-
-async def _build_supplier_details_llm(
-    extracted: dict,
-    llm_config: dict,
-    session_id: str,
-    glossary_context: str = "",
-    chunk_size: int = _DETAIL_CHUNK_SIZE,
-) -> list[dict]:
-    """
-    Build Slide 2 supplier_details via chunked LLM calls.
-
-    1. Filter to affected suppliers (severity R or Y).
-    2. Split into chunks of chunk_size.
-    3. Send each chunk to the LLM.
-    4. On per-chunk failure, fall back to deterministic mapping for
-       that chunk's suppliers.
-    5. Merge all chunk results.
-    """
-    suppliers = extracted.get("suppliers", [])
-    affected = [
-        s for s in suppliers
-        if str(s.get("severity", "")).upper() in ("R", "Y")
-    ]
-
-    if not affected:
-        print("[SID DEBUG] No affected suppliers — skipping Slide 2 LLM calls")
-        return []
-
-    chunks = _chunk_supplier_list(affected, chunk_size)
-    total_chunks = len(chunks)
-    today = date.today().strftime("%d.%m.%Y")
-    current_cw = extracted.get("current_cw", "CW??/????")
-
-    print(f"[SID DEBUG] ── Slide 2: {len(affected)} affected suppliers → "
-          f"{total_chunks} chunk(s) of ≤{chunk_size} ──")
-
-    glossary_block = (
-        f"\n\nCOMPANY GLOSSARY:\n{glossary_context}" if glossary_context else ""
-    )
-    system_prompt = _DETAIL_SYSTEM.format(
-        glossary_block=glossary_block,
-    )
-
-    llm = _create_llm(llm_config, max_tokens=16000)
-    all_details: list[dict] = []
-    failed_chunks = 0
-
-    for i, chunk in enumerate(chunks):
-        result = await _generate_detail_chunk(
-            chunk, llm, system_prompt, today, current_cw,
-            session_id, llm_config, i, total_chunks,
-        )
-        if result is not None and len(result) > 0:
-            all_details.extend(result)
-        else:
-            # Per-chunk deterministic fallback
-            failed_chunks += 1
-            fallback = _build_supplier_details_deterministic(chunk)
-            all_details.extend(fallback)
-            print(f"[SID DEBUG] detail_chunk {i + 1}/{total_chunks}: "
-                  f"using deterministic fallback ({len(fallback)} rows)")
-
-    if failed_chunks:
-        print(f"[SID WARNING] {failed_chunks}/{total_chunks} detail chunk(s) "
-              f"fell back to deterministic mapping")
-
-    print(f"[SID DEBUG] ── Slide 2 complete: {len(all_details)} detail rows "
-          f"({total_chunks} chunks, {failed_chunks} fallback) ──")
-
-    return all_details
 
 
 async def llm_generate_slide_spec(
@@ -646,8 +401,8 @@ async def llm_generate_slide_spec(
     session_id: str,
     glossary_context: str = "",
 ) -> dict:
-    """Stage 3: LLM generates Slide 1 spec; Slide 2 details via chunked LLM calls."""
-    llm = _create_llm(llm_config, max_tokens=16000)
+    """Stage 3: LLM generates a complete slide specification."""
+    llm = _create_llm(llm_config, max_tokens=64000)
     t0 = time.time()
     today = date.today().strftime("%d.%m.%Y")
     current_cw = extracted.get("current_cw", "CW??/????")
@@ -670,7 +425,6 @@ async def llm_generate_slide_spec(
         HumanMessage(content=_SLIDES_USER.format(
             today=today,
             current_cw=current_cw,
-            n_suppliers=n_input_suppliers,
             extracted_json=extracted_json,
         )),
     ]
@@ -694,30 +448,20 @@ async def llm_generate_slide_spec(
         log_tokens(session_id, "sid_llm_slide_spec", usage,
                    llm_config.get("azure_deployment", ""))
 
-        slide1_duration = (time.time() - t0) * 1000
+        duration = (time.time() - t0) * 1000
         n_affected = len(spec.get("affected_suppliers", []))
-        n_actions = len(spec.get("actions", []))
-        print(f"[SID DEBUG] Slide 1 spec: {n_affected} affected, "
-              f"{n_actions} actions, severity={spec.get('overall_severity', '?')} "
-              f"({slide1_duration:.0f}ms)")
-
-        # ── Build Slide 2 (supplier details) via chunked LLM ────
-        spec["supplier_details"] = await _build_supplier_details_llm(
-            extracted, llm_config, session_id, glossary_context,
-        )
-
-        total_duration = (time.time() - t0) * 1000
         n_details = len(spec.get("supplier_details", []))
+        n_actions = len(spec.get("actions", []))
 
-        print(f"[SID DEBUG] Slide spec complete: {n_affected} affected, "
+        print(f"[SID DEBUG] Slide spec generated: {n_affected} affected suppliers, "
               f"{n_details} detail rows, {n_actions} actions "
-              f"({total_duration:.0f}ms total)")
+              f"(severity={spec.get('overall_severity', '?')}, {duration:.0f}ms)")
 
         log_trace(session_id, "sid_llm_slide_spec",
-                  f"Input: {n_input_suppliers} suppliers",
-                  f"Spec: {n_affected} affected, {n_details} detail rows "
-                  f"(chunked LLM), {n_actions} actions ({total_duration:.0f}ms)",
-                  total_duration)
+                  f"Input: {len(extracted.get('suppliers', []))} suppliers",
+                  f"Spec: {n_affected} affected, {n_details} detail rows, "
+                  f"{n_actions} actions ({duration:.0f}ms)",
+                  duration)
         return spec
 
     except json.JSONDecodeError as exc:
@@ -785,8 +529,23 @@ def _deterministic_fallback_spec(extracted: dict) -> dict:
             "remarks": (s.get("process_impacted", "") or "")[:120],
         })
 
-    # Build details table (reuse the shared deterministic mapper)
-    details = _build_supplier_details_deterministic(affected)
+    # Build details table
+    details = []
+    for s in affected:
+        details.append({
+            "supplier_name": s.get("vendor", ""),
+            "host": "",
+            "material_planner": s.get("category_buyer", ""),
+            "sda": "",
+            "coverage_date": s.get("date", ""),
+            "coverage_after_actions": str(s.get("current_fuel_coverage", "") or ""),
+            "affected_product": s.get("device_product_line", ""),
+            "customer": "; ".join(filter(None, [
+                s.get("dom_customer_name", ""),
+                s.get("ico_customer_name", ""),
+            ])),
+            "remarks": s.get("remarks", ""),
+        })
 
     # Default actions
     actions = [
@@ -1050,11 +809,11 @@ def _render_slide1(prs, layout, spec: dict) -> None:
 
 # ─── Slide 2 renderer ───────────────────────────────────────────────
 
-def _render_slide2(prs, layout, spec: dict, details: list[dict],
-                   page_num: int = 0, total_detail_pages: int = 1) -> None:
-    """Render one supplier detail slide (paginated)."""
+def _render_slide2(prs, layout, spec: dict) -> None:
+    """Render the supplier detail slide."""
     slide = _add_slide(prs, layout)
 
+    details = spec.get("supplier_details", [])
     last_update = spec.get("last_update", date.today().strftime("%d.%m.%Y"))
     footer_text = spec.get("footer_text", "T/SC SDA")
 
@@ -1064,12 +823,9 @@ def _render_slide2(prs, layout, spec: dict, details: list[dict],
         sp.getparent().remove(sp)
 
     # ── Title ──
-    title_text = "Fulfillment Overview (impacted suppliers)"
-    if total_detail_pages > 1:
-        title_text = f"{title_text}  ({page_num + 1}/{total_detail_pages})"
     _add_textbox(slide,
                  Inches(0.09), Inches(0.08), Inches(8.10), Inches(0.23),
-                 title_text,
+                 "Fulfillment Overview (impacted suppliers)",
                  font_size=14, bold=True, color=_C["DARK_BLUE"])
 
     # ── Last Update ──
@@ -1179,7 +935,7 @@ def _render_slide2(prs, layout, spec: dict, details: list[dict],
 
     _add_textbox(slide,
                  Inches(9.41), Inches(5.39), Inches(0.32), Inches(0.16),
-                 str(page_num + 2), font_size=7, color=_C["GREY"], align=PP_ALIGN.RIGHT)
+                 "2", font_size=7, color=_C["GREY"], align=PP_ALIGN.RIGHT)
 
 
 # ─── Main renderer ──────────────────────────────────────────────────
@@ -1190,29 +946,14 @@ def render_pptx_from_spec(slide_spec: dict,
                           ) -> io.BytesIO:
     """
     Stage 4 (deterministic renderer): Convert slide spec to PPTX.
-    Produces 1 overview slide + N detail slides (paginated at
-    _MAX_DETAIL_ROWS_PER_SLIDE rows each).
+    Always produces exactly 2 slides.
     """
     prs, layout = _load_base_presentation(template_path)
 
     _render_slide1(prs, layout, slide_spec)
+    _render_slide2(prs, layout, slide_spec)
 
-    # ── Paginate supplier details across multiple slides ──────────────
-    all_details = slide_spec.get("supplier_details", [])
-    if not all_details:
-        detail_pages: list[list[dict]] = [[]]
-    else:
-        detail_pages = [
-            all_details[i: i + _MAX_DETAIL_ROWS_PER_SLIDE]
-            for i in range(0, len(all_details), _MAX_DETAIL_ROWS_PER_SLIDE)
-        ]
-
-    total_detail_pages = len(detail_pages)
-    for page_idx, page_details in enumerate(detail_pages):
-        _render_slide2(prs, layout, slide_spec, page_details,
-                       page_num=page_idx, total_detail_pages=total_detail_pages)
-
-    slide_spec["slide_count"] = 1 + total_detail_pages
+    slide_spec["slide_count"] = 2
 
     buf = io.BytesIO()
     prs.save(buf)
