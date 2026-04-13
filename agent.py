@@ -5,6 +5,7 @@ Agentic workflow for section-by-section summarization
 with conversation-based refinement.
 """
 
+import asyncio
 import time
 import uuid
 from datetime import datetime, timezone
@@ -70,15 +71,22 @@ class AgentState(TypedDict):
 
 # ─── LLM Setup ───────────────────────────────────────────────────────
 
-def create_llm(config: dict) -> AzureChatOpenAI:
-    """Create AzureChatOpenAI instance from config."""
+def create_llm(config: dict, max_tokens: int = 64000) -> AzureChatOpenAI:
+    """Create AzureChatOpenAI instance from config.
+
+    Args:
+        config: Azure OpenAI connection config.
+        max_tokens: Maximum completion tokens. Sized per call-type to avoid
+                    over-reserving capacity on the Azure side, which can slow
+                    scheduling and inflate latency.
+    """
     return AzureChatOpenAI(
         azure_deployment=config["azure_deployment"],
         azure_endpoint=config["azure_endpoint"],
         api_key=config["api_key"],
         api_version=config.get("api_version", "2024-12-01-preview"),
         #temperature=0.2,
-        max_tokens=64000,
+        max_tokens=max_tokens,
     )
 
 
@@ -271,23 +279,23 @@ Original section summaries for reference:
 # ─── Graph Nodes ──────────────────────────────────────────────────────
 
 async def summarize_sections_node(state: AgentState) -> dict:
-    """Node: Summarize each section independently."""
+    """Node: Summarize each section independently, in parallel."""
     config = state["llm_config"]
-    llm = create_llm(config)
     parsed = state["parsed_ppt"]
     session_id = state["session_id"]
     glossary = state.get("glossary_context", "")
     glossary_block = f"\n\n{glossary}" if glossary else ""
-    section_summaries = []
 
-    for i, section in enumerate(parsed["sections"]):
+    async def _summarize_one(i: int, section: dict) -> dict:
+        """Summarize a single section (runs as a concurrent coroutine)."""
+        llm = create_llm(config, max_tokens=64000)
         t0 = time.time()
         section_name = section["section_name"]
         content = section["formatted_content"]
 
         # Truncate very long sections to avoid token limits per call
-        if len(content) > 15000:
-            content = content[:15000] + "\n\n[Content truncated for processing - additional slides in section]"
+        #if len(content) > 15000:
+        #    content = content[:15000] + "\n\n[Content truncated for processing - additional slides in section]"
 
         messages = [
             SystemMessage(content=SECTION_SUMMARY_SYSTEM.format(glossary_block=glossary_block)),
@@ -303,49 +311,61 @@ async def summarize_sections_node(state: AgentState) -> dict:
             log_tokens(session_id, f"section_summary_{i}_{section_name}", usage,
                        config.get("azure_deployment", ""))
 
-            section_summaries.append({
+            duration = (time.time() - t0) * 1000
+            log_trace(session_id, "summarize_section",
+                      f"Section: {section_name} ({section['slide_count']} slides)",
+                      summary_text[:200], duration,
+                      {"section_index": i, "input_chars": len(content)})
+
+            return {
                 "section_name": section_name,
                 "slide_count": section["slide_count"],
                 "slide_numbers": section["slide_numbers"],
                 "summary": summary_text
-            })
-
-            duration = (time.time() - t0) * 1000
-            log_trace(session_id, "summarize_section", 
-                      f"Section: {section_name} ({section['slide_count']} slides)",
-                      summary_text[:200], duration,
-                      {"section_index": i, "input_chars": len(content)})
+            }
         except Exception as e:
-            section_summaries.append({
+            log_trace(session_id, "summarize_section",
+                      f"Section: {section_name}", f"ERROR: {str(e)}",
+                      (time.time() - t0) * 1000, {"error": True})
+            return {
                 "section_name": section_name,
                 "slide_count": section["slide_count"],
                 "slide_numbers": section["slide_numbers"],
                 "summary": f"[Error summarizing section: {str(e)}]"
-            })
-            log_trace(session_id, "summarize_section",
-                      f"Section: {section_name}", f"ERROR: {str(e)}",
-                      (time.time() - t0) * 1000, {"error": True})
+            }
+
+    # Fire all section summaries concurrently
+    tasks = [_summarize_one(i, section) for i, section in enumerate(parsed["sections"])]
+    section_summaries = list(await asyncio.gather(*tasks))
 
     return {"section_summaries": section_summaries}
 
 
-async def generate_executive_summary_node(state: AgentState) -> dict:
-    """Node: Generate final executive summary from all section summaries."""
-    config = state["llm_config"]
-    llm = create_llm(config)
-    session_id = state["session_id"]
-    parsed = state["parsed_ppt"]
+async def prepare_summaries_text_node(state: AgentState) -> dict:
+    """Node: Concatenate section summaries into a single text block.
+
+    Factored out so that executive-slide and email synthesis can both
+    read all_summaries_text from state and run in parallel.
+    """
     section_summaries = state["section_summaries"]
-    glossary = state.get("glossary_context", "")
-    glossary_block = f"\n\n{glossary}" if glossary else ""
-
-    t0 = time.time()
-
-    # Combine all section summaries
     all_summaries_text = ""
     for ss in section_summaries:
         all_summaries_text += f"\n\n### {ss['section_name']} (Slides {ss['slide_numbers'][0]}-{ss['slide_numbers'][-1]})\n"
         all_summaries_text += ss["summary"]
+    return {"all_summaries_text": all_summaries_text}
+
+
+async def _generate_executive_summary(state: AgentState) -> dict:
+    """Generate final executive summary from all section summaries."""
+    config = state["llm_config"]
+    llm = create_llm(config, max_tokens=64000)
+    session_id = state["session_id"]
+    parsed = state["parsed_ppt"]
+    all_summaries_text = state["all_summaries_text"]
+    glossary = state.get("glossary_context", "")
+    glossary_block = f"\n\n{glossary}" if glossary else ""
+
+    t0 = time.time()
 
     messages = [
         SystemMessage(content=EXECUTIVE_SUMMARY_SYSTEM.format(glossary_block=glossary_block)),
@@ -364,16 +384,16 @@ async def generate_executive_summary_node(state: AgentState) -> dict:
 
     duration = (time.time() - t0) * 1000
     log_trace(session_id, "generate_executive_summary",
-              f"Combined {len(section_summaries)} section summaries",
+              f"Combined {len(state['section_summaries'])} section summaries",
               exec_summary[:300], duration)
 
-    return {"executive_summary": exec_summary, "all_summaries_text": all_summaries_text}
+    return {"executive_summary": exec_summary}
 
 
-async def generate_email_summary_node(state: AgentState) -> dict:
-    """Node: Generate email status summary from section summaries."""
+async def _generate_email_summary(state: AgentState) -> dict:
+    """Generate email status summary from section summaries."""
     config = state["llm_config"]
-    llm = create_llm(config)
+    llm = create_llm(config, max_tokens=64000)
     session_id = state["session_id"]
     parsed = state["parsed_ppt"]
     all_summaries_text = state["all_summaries_text"]
@@ -405,20 +425,43 @@ async def generate_email_summary_node(state: AgentState) -> dict:
     return {"email_summary": email_text}
 
 
+async def generate_both_summaries_node(state: AgentState) -> dict:
+    """Node: Generate executive-slide and email summaries in parallel.
+
+    Both depend only on all_summaries_text (produced by prepare_text),
+    so they can safely overlap.
+    """
+    exec_result, email_result = await asyncio.gather(
+        _generate_executive_summary(state),
+        _generate_email_summary(state),
+    )
+    return {**exec_result, **email_result}
+
+
 # ─── Build the Graph ──────────────────────────────────────────────────
 
 def build_summarization_graph():
-    """Build the LangGraph for the summarization workflow."""
+    """Build the LangGraph for the summarization workflow.
+
+    Pipeline (with parallelism):
+      summarize_sections   — all sections fire concurrently
+            ↓
+      prepare_text         — concatenate section summaries (instant)
+            ↓
+      generate_both        — executive-slide + email run concurrently
+            ↓
+           END
+    """
     workflow = StateGraph(AgentState)
 
     workflow.add_node("summarize_sections", summarize_sections_node)
-    workflow.add_node("generate_executive_summary", generate_executive_summary_node)
-    workflow.add_node("generate_email_summary", generate_email_summary_node)
+    workflow.add_node("prepare_text", prepare_summaries_text_node)
+    workflow.add_node("generate_both_summaries", generate_both_summaries_node)
 
     workflow.set_entry_point("summarize_sections")
-    workflow.add_edge("summarize_sections", "generate_executive_summary")
-    workflow.add_edge("generate_executive_summary", "generate_email_summary")
-    workflow.add_edge("generate_email_summary", END)
+    workflow.add_edge("summarize_sections", "prepare_text")
+    workflow.add_edge("prepare_text", "generate_both_summaries")
+    workflow.add_edge("generate_both_summaries", END)
 
     return workflow.compile()
 
@@ -429,7 +472,7 @@ async def refine_summary(session_id: str, llm_config: dict,
                          current_summary: str, section_summaries_text: str,
                          user_instruction: str, glossary_context: str = "") -> str:
     """Refine the executive slide summary based on user instructions."""
-    llm = create_llm(llm_config)
+    llm = create_llm(llm_config, max_tokens=64000)
     t0 = time.time()
     glossary_block = f"\n\n{glossary_context}" if glossary_context else ""
 
@@ -460,7 +503,7 @@ async def refine_email(session_id: str, llm_config: dict,
                        current_email: str, section_summaries_text: str,
                        user_instruction: str, glossary_context: str = "") -> str:
     """Refine the email summary based on user instructions."""
-    llm = create_llm(llm_config)
+    llm = create_llm(llm_config, max_tokens=64000)
     t0 = time.time()
     glossary_block = f"\n\n{glossary_context}" if glossary_context else ""
 
@@ -499,7 +542,7 @@ async def generate_delta_email(
     Generate a delta/changes-only email by comparing current vs previous
     all_summaries_text (same structured format, section-labelled, fact-dense).
     """
-    llm = create_llm(llm_config)
+    llm = create_llm(llm_config, max_tokens=64000)
     t0 = time.time()
     glossary_block = f"\n\n{glossary_context}" if glossary_context else ""
 
