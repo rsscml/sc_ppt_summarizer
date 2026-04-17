@@ -732,11 +732,76 @@ structured JSON object.
    If no product family column exists, infer groupings from context (e.g. shared
    component type or shared root cause block). Use "Unknown" only as a last resort.
 
-2. COVERAGE CW FIELDS
-   For "Coverage w/o mitigation" and "Coverage w/ mitigation" (and any synonyms like
-   "Coverage without", "Coverage with", "Deckung ohne", "Deckung mit"):
-   — Extract the CW number as a plain INTEGER (e.g. "CW15" → 15, "KW15/2026" → 15).
-   — If the cell is empty or unparseable, use null.
+2. COVERAGE FIELDS — coverage_without_mitigation_cw / coverage_with_mitigation_cw 
+   ═══════════════════════════════════════════════════════════════════════════
+   GOAL — Normalise every coverage cell to the canonical form CW<WEEK_NUMBER>,
+   where WEEK_NUMBER is an ISO 8601 calendar week integer in the range 1–53.
+   The Excel file expresses this information in THREE different ways; your
+   job is to recognise all three and convert each to the same canonical form.
+
+   Once you have the canonical CW<WEEK_NUMBER>, emit ONLY the integer
+   WEEK_NUMBER into the JSON field (e.g. canonical form CW15 → emit 15).
+   Emit null only if the cell cannot be mapped to any of the three forms.
+
+   The current calendar week is given at the top of the user message
+   (e.g. "CW13/2026"). Call its numeric portion CURRENT_WEEK — you will
+   need it for Form C.
+
+   ── Form A — Explicit CW / KW label ────────────────────────────────
+       Already in (or near) canonical form — just extract the week digits.
+         "CW15"        →  canonical CW15  →  emit 15
+         "CW15/2026"   →  canonical CW15  →  emit 15
+         "KW15"        →  canonical CW15  →  emit 15
+         "kw 15"       →  canonical CW15  →  emit 15
+         "Woche 15"    →  canonical CW15  →  emit 15
+         "W15"         →  canonical CW15  →  emit 15
+       Drop any year suffix.
+
+   ── Form B — Calendar date → canonical CW ──────────────────────────
+       Accept ONLY these formats (day-first European or ISO):
+         dd/mm/yyyy, dd/mm/yy, dd.mm.yyyy, dd.mm.yy,
+         dd-mm-yyyy, dd-mm-yy, yyyy-mm-dd, yyyy/mm/dd, yyyy.mm.dd
+       Convert the date to its ISO 8601 week number, form the canonical
+       label CW<that_week>, then emit the integer.
+         "15/05/2026"  →  ISO week 20  →  canonical CW20  →  emit 20
+         "15.05.2026"  →  ISO week 20  →  canonical CW20  →  emit 20
+         "2026-05-15"  →  ISO week 20  →  canonical CW20  →  emit 20
+       Any date missing a year component (e.g. "03.04.", "15 May")
+         → null.  Do NOT guess the year.
+
+   ── Form C — Days of remaining coverage → canonical CW ─────────────
+       A bare number with no "CW"/"KW"/"Woche"/"W" prefix and no date
+       separators means "that many days of supply remaining, counted
+       from the current week". Convert to canonical CW with:
+           canonical_week = CURRENT_WEEK + (days // 7)
+       then emit canonical_week as the integer.
+       Examples (assuming CURRENT_WEEK = 13):
+         "0"      →  canonical CW13  →  emit 13
+         "3"      →  canonical CW13  →  emit 13
+         "7"      →  canonical CW14  →  emit 14
+         "14"     →  canonical CW15  →  emit 15
+         "21"     →  canonical CW16  →  emit 16
+       A trailing "d", "days", or "Tage" still counts as Form C:
+         "14d", "14 days", "14 Tage"  →  canonical CW15  →  emit 15
+
+   ── Canonical-form check before emitting ───────────────────────────
+   Before writing the integer into the JSON, mentally verify you have
+   a valid canonical label of the form CW<N>, where N is an integer
+   in 1–53.  If N falls outside that range (e.g. Form C produced 58
+   because CURRENT_WEEK is late in the year plus many days), cap it
+   at 53 and add a note to extraction_notes explaining which row and
+   what the raw cell contained.
+
+   ── Disambiguation — apply in this order ───────────────────────────
+     1. Any "CW" / "KW" / "Woche" / "W" prefix, or a "/yyyy" suffix
+        → Form A.
+     2. Any dot-, slash-, or dash-separated triplet matching a listed
+        date pattern → Form B.
+     3. A bare integer (with or without "d"/"days"/"Tage") → Form C.
+     4. Anything else — empty, "-", "n/a", "TBD", "pending", free
+        text you cannot map → null, and add a short note to
+        extraction_notes describing what you saw (e.g. "Coverage cell
+        'end of month' on R047 could not be parsed.").
 
 3. TEXT FIELDS — preserve the content verbatim but flatten to single-line strings.
    Excel cells often contain line breaks, tabs, and other control characters.
