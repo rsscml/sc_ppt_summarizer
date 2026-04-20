@@ -855,6 +855,64 @@ structured JSON object.
          • If the cell contains multiple "CW" mentions (e.g. "CW18
            with risk, CW22 without"), the FIRST one wins — do not
            pick the largest.
+   ── Form G — "No risk" / fully covered sentinel ────────────────────
+       A cell whose trimmed, lowercased value matches any of:
+         "no risk", "no risk at the moment", "no risk at present",
+         "no risk currently", "not at risk", "fully covered",
+         "full coverage", "covered", "kein risiko", "keine gefahr"
+       — or contains "no risk" as a substring of a short phrase
+       (≤ 6 words total) — means coverage is green across the
+       entire foreseeable horizon. Emit the integer 53 (the
+       canonical-form upper cap), which downstream logic treats
+       as "covered for every forward-looking CW on the slide".
+       Examples:
+         "no risk at the moment"  →  canonical CW53  →  emit 53
+         "No risk"                →  canonical CW53  →  emit 53
+         "fully covered"          →  canonical CW53  →  emit 53
+         "kein Risiko"            →  canonical CW53  →  emit 53
+
+       Guardrail — Form G applies ONLY when the "no risk" phrase
+       is the whole cell (or essentially the whole cell). A longer
+       sentence like "No risk identified in CW15 but exposure rises
+       in CW20" is NOT Form G; fall through to Form F, which will
+       extract CW15.
+
+   ── Form H — Month name → end-of-month CW ──────────────────────────
+       A cell whose trimmed value is a month name (full or 3-letter
+       abbreviation, English or German, case-insensitive) means
+       coverage runs through the END of that month. Convert by
+       computing the ISO 8601 week number of the LAST DAY of that
+       month in the applicable year, then emit that integer.
+
+       Recognised month names:
+         January/Jan, February/Feb, March/Mar, April/Apr, May,
+         June/Jun, July/Jul, August/Aug, September/Sep/Sept,
+         October/Oct, November/Nov, December/Dec
+         Januar, Februar, März/Maerz, April, Mai, Juni, Juli,
+         August, September, Oktober, November, Dezember
+
+       Year resolution — the cell rarely carries a year, so infer:
+         • If the named month's number is ≥ CURRENT_WEEK's month
+           → use the SAME calendar year as CURRENT_WEEK.
+         • If the named month's number is < CURRENT_WEEK's month
+           → use the NEXT calendar year (coverage rolls forward).
+         If the cell includes an explicit year (e.g. "May 2026",
+         "Mai/2027"), honour that year exactly.
+
+       Examples (assuming CURRENT_WEEK = CW13/2026, i.e. late March):
+         "May"        →  31 May 2026 → ISO week 22 →  emit 22
+         "May 2026"   →  31 May 2026 → ISO week 22 →  emit 22
+         "April"      →  30 Apr 2026 → ISO week 18 →  emit 18
+         "February"   →  month < current → year 2027
+                      →  28 Feb 2027 → ISO week  9 →  emit  9
+         "Dec"        →  31 Dec 2026 → ISO week 53 →  emit 53
+         "Mai"        →  31 May 2026 → ISO week 22 →  emit 22
+
+       Guardrail — Form H applies ONLY when the cell's entire value
+       is a month name (optionally with a year). "Secured until end
+       of May" is NOT Form H — it is free text; Form F will handle
+       it only if a "CW"/"KW" substring is present, otherwise it
+       falls to null. Do NOT infer a month from arbitrary free text. 
 
    ── Canonical-form check before emitting ───────────────────────────
    Before writing the integer into the JSON, mentally verify you have
@@ -866,18 +924,22 @@ structured JSON object.
 
    ── Disambiguation — apply in this order ───────────────────────────
      1. Cell trimmed exactly matches a Form D keyword → Form D.
-     2. Cell contains a range/comparator/bound expression (">", "<",
+     2. Cell trimmed (≤ 6 words) matches a Form G "no risk" phrase
+        → Form G.
+     3. Cell trimmed is a month name alone, optionally with a year
+        → Form H.
+     4. Cell contains a range/comparator/bound expression (">", "<",
         "-", "to", "between", "ab", "nach", "bis", "until", "before",
         "after", "beyond") → Form E.
-     3. Any "CW" / "KW" / "Woche" / "W" prefix at the start of the
+     5. Any "CW" / "KW" / "Woche" / "W" prefix at the start of the
         trimmed cell, or a "/yyyy" suffix → Form A.
-     4. Cell trimmed matches a date pattern from the whitelist
+     6. Cell trimmed matches a date pattern from the whitelist
         → Form B.
-     5. Cell trimmed is a bare integer, with or without "d"/"days"/
+     7. Cell trimmed is a bare integer, with or without "d"/"days"/
         "Tage" → Form C.
-     6. Cell is a longer string not matching any of the above, but
+     8. Cell is a longer string not matching any of the above, but
         contains "CW" or "KW" followed by 1–2 digits → Form F.
-     7. Anything else — empty, "-", "n/a", "TBD", "pending", free
+     9. Anything else — empty, "-", "n/a", "TBD", "pending", free
         text with no CW marker → null, and add a short note to
         extraction_notes describing what you saw.
 
