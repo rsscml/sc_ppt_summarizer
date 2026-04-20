@@ -783,6 +783,78 @@ structured JSON object.
          "21"     →  canonical CW16  →  emit 16
        A trailing "d", "days", or "Tage" still counts as Form C:
          "14d", "14 days", "14 Tage"  →  canonical CW15  →  emit 15
+    
+    ── Form D — Zero / exhausted coverage ─────────────────────────────
+       A cell whose entire value (after trimming whitespace, quotes,
+       and leading apostrophes, case-insensitive) equals one of:
+         "0", "zero", "none", "exhausted", "nil", "null", "n.a. coverage",
+         "no coverage", "keine", "keine deckung"
+       means supply is already gone. Convert to the LAST COMPLETED
+       calendar week — the week immediately before CURRENT_WEEK:
+           canonical_week = CURRENT_WEEK - 1
+       Emit that integer. If CURRENT_WEEK is 1, emit 52.
+       Examples (assuming CURRENT_WEEK = 13):
+         "zero"         →  canonical CW12  →  emit 12
+         "NONE"         →  canonical CW12  →  emit 12
+         "no coverage"  →  canonical CW12  →  emit 12
+
+       IMPORTANT — do not confuse Form D's textual "0"/"zero" with
+       Form C's numeric "0". A bare numeric zero ("0") is ambiguous;
+       treat it as Form D (exhausted) because Form C's "CURRENT_WEEK
+       + 0" is the current week, not a meaningful coverage boundary.
+
+   ── Form E — Range or open-ended expression ───────────────────────
+       A coverage cell may express a range or a lower bound. Always
+       take the UPPER (latest) week in the expression and convert
+       through whichever earlier form (A, B, C) applies to that
+       upper value. Recognise:
+
+         •  ">CW26", "> CW 26", ">=CW26", "after CW26", "beyond CW26",
+            "ab CW26", "nach CW26"
+              → treat the quoted week as the upper bound
+              →  canonical CW26  →  emit 26
+
+         •  "CW19 - CW22", "CW19-CW22", "CW 19 to CW 22", "KW19-22",
+            "between CW19 and CW22"
+              → take the upper endpoint
+              →  canonical CW22  →  emit 22
+
+         •  "<CW18", "before CW18", "bis CW18", "until CW18"
+              → upper bound IS the quoted week itself
+              →  canonical CW18  →  emit 18
+
+         •  A range expressed with dates, e.g. "15.04.2026 - 15.05.2026"
+              → convert the later date to its ISO week per Form B
+              →  canonical CW20  →  emit 20
+
+       If the cell is purely a lower-bound phrase with no number
+       (e.g. "open", "ongoing", "tbd") → null (see Disambiguation
+       step 6).
+
+   ── Form F — CW buried in free text (last-resort extraction) ──────
+       If the cell is a longer sentence or comment (i.e. it did not
+       match any form above as a clean value), scan it for the
+       literal substring "CW" or "KW" (case-insensitive), allow an
+       optional space, and read the immediately following 1–2 digits.
+       Take the FIRST such match and apply Form A's extraction to it.
+         "Secured until CW22 pending allocation"   → 22
+         "Coverage cw 8 only"                      →  8
+         "Stop shipment; resume after KW35/2026"   → 35
+       If no "CW"/"KW" substring is found, or the characters after
+       it are not digits, → null.
+
+       Guardrails for Form F:
+         • Apply ONLY as a last resort, after every cleaner form has
+           failed. Clean short cells like "CW15", "15/05/2026", and
+           "14" must continue to be handled by Forms A/B/C — do not
+           fall through to Form F just because the cell contains
+           "CW" somewhere.
+         • Do not extract from action_comment, special_freight_remarks,
+           root_cause, or any other free-text field. Form F applies
+           ONLY when the source cell is the Coverage column itself.
+         • If the cell contains multiple "CW" mentions (e.g. "CW18
+           with risk, CW22 without"), the FIRST one wins — do not
+           pick the largest.
 
    ── Canonical-form check before emitting ───────────────────────────
    Before writing the integer into the JSON, mentally verify you have
@@ -793,15 +865,21 @@ structured JSON object.
    what the raw cell contained.
 
    ── Disambiguation — apply in this order ───────────────────────────
-     1. Any "CW" / "KW" / "Woche" / "W" prefix, or a "/yyyy" suffix
-        → Form A.
-     2. Any dot-, slash-, or dash-separated triplet matching a listed
-        date pattern → Form B.
-     3. A bare integer (with or without "d"/"days"/"Tage") → Form C.
-     4. Anything else — empty, "-", "n/a", "TBD", "pending", free
-        text you cannot map → null, and add a short note to
-        extraction_notes describing what you saw (e.g. "Coverage cell
-        'end of month' on R047 could not be parsed.").
+     1. Cell trimmed exactly matches a Form D keyword → Form D.
+     2. Cell contains a range/comparator/bound expression (">", "<",
+        "-", "to", "between", "ab", "nach", "bis", "until", "before",
+        "after", "beyond") → Form E.
+     3. Any "CW" / "KW" / "Woche" / "W" prefix at the start of the
+        trimmed cell, or a "/yyyy" suffix → Form A.
+     4. Cell trimmed matches a date pattern from the whitelist
+        → Form B.
+     5. Cell trimmed is a bare integer, with or without "d"/"days"/
+        "Tage" → Form C.
+     6. Cell is a longer string not matching any of the above, but
+        contains "CW" or "KW" followed by 1–2 digits → Form F.
+     7. Anything else — empty, "-", "n/a", "TBD", "pending", free
+        text with no CW marker → null, and add a short note to
+        extraction_notes describing what you saw.
 
 3. TEXT FIELDS — preserve the content verbatim but flatten to single-line strings.
    Excel cells often contain line breaks, tabs, and other control characters.
